@@ -1,39 +1,22 @@
 import os
-import re
-import json
 import urllib.request
-import urllib.parse
-from html import unescape
+import re
 from html.parser import HTMLParser
 
-ENDLESS_URL = "https://endless.app/radar/tiktok/turkey"
-CAPCUT_URL = "https://www.capcut.com/tr-tr/explore/capcut-all-templates-trending/7497638301391407120"
+SITES = {
+    "TikTok Turkey": "https://endless.app/radar/tiktok/turkey",
+    "CapCut Turkey": "https://www.capcut.com/explore/turkish-templates"
+}
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-
-def get_page(url):
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0"}
-    )
-    with urllib.request.urlopen(req, timeout=30) as response:
-        return response.read().decode("utf-8", errors="replace")
-
-class PageParser(HTMLParser):
-    def __init__(self, html):
+class LinkParser(HTMLParser):
+    def __init__(self):
         super().__init__()
         self.links = []
         self.current = None
-        self.html = html
 
     def handle_starttag(self, tag, attrs):
         if tag == "a":
-            attrs = dict(attrs)
-            self.current = {
-                "href": attrs.get("href", ""),
-                "text": ""
-            }
+            self.current = {"href": dict(attrs).get("href", ""), "text": ""}
 
     def handle_data(self, data):
         if self.current is not None:
@@ -44,119 +27,57 @@ class PageParser(HTMLParser):
             self.links.append(self.current)
             self.current = None
 
-def get_count(text, unit):
-    pattern = r"([\d.,]+[KMBT]?)\s*" + unit
-    match = re.search(pattern, text, re.I)
-    return match.group(1) + " " + unit if match else "Göstərilməyib"
+def main():
+    report = ["🔎 MƏNBƏ YOXLAMASI"]
 
-def collect_tiktok():
-    html = get_page(ENDLESS_URL)
-    parser = PageParser(html)
+    for name, url in SITES.items():
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
 
-    sounds = []
-    hashtags = []
+            with urllib.request.urlopen(req, timeout=30) as response:
+                html = response.read().decode("utf-8", errors="replace")
+                status = response.status
 
-    for item in parser.links:
-        url = item["href"]
-        name = unescape(item["text"]).strip()
+            parser = LinkParser()
+            parser.feed(html)
 
-        if not name or name.isdigit():
-            continue
+            report.append(
+                f"\n{name}\n"
+                f"HTTP status: {status}\n"
+                f"Səhifə ölçüsü: {len(html)} simvol\n"
+                f"Tapılan linklər: {len(parser.links)}"
+            )
 
-        if "tiktok.com/music/" in url and len(sounds) < 10:
-            sounds.append((name, url))
+            for link in parser.links[:5]:
+                report.append(
+                    f"- {link['text'].strip()[:70]} | {link['href'][:120]}"
+                )
 
-        if "tiktok.com/tag/" in url and len(hashtags) < 10:
-            hashtags.append((name, url))
+        except Exception as error:
+            report.append(f"\n{name}: XƏTA: {str(error)[:200]}")
 
-    return sounds, hashtags
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
-def collect_capcut():
-    html = get_page(CAPCUT_URL)
-    parser = PageParser(html)
+    import json
 
-    templates = []
-
-    for item in parser.links:
-        url = item["href"]
-        name = unescape(item["text"]).strip()
-
-        if "capcut.com" not in url:
-            continue
-
-        if "template-detail" not in url:
-            continue
-
-        if not name or name.isdigit():
-            continue
-
-        templates.append((name, url))
-
-        if len(templates) == 10:
-            break
-
-    return templates
-
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-
-    data = urllib.parse.urlencode({
-        "chat_id": CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": "true"
+    data = json.dumps({
+        "chat_id": chat_id,
+        "text": "\n".join(report)
     }).encode()
 
-    req = urllib.request.Request(url, data=data)
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=data,
+        headers={"Content-Type": "application/json"}
+    )
 
-    with urllib.request.urlopen(req, timeout=30) as response:
-        result = json.loads(response.read())
-
-    if not result.get("ok"):
-        raise RuntimeError("Telegram mesajı göndərilmədi.")
-
-def make_section(title, items):
-    lines = [title]
-
-    if not items:
-        lines.append("Bu gün məlumat əldə edilmədi.")
-        return "\n".join(lines)
-
-    for index, item in enumerate(items, 1):
-        name, url = item
-        lines.append(f"{index}. {name}\n{url}")
-
-    return "\n".join(lines)
-
-def main():
-    report = ["🇹🇷 TURKEY TREND MONITOR", "Gündəlik hesabat", ""]
-
-    try:
-        sounds, hashtags = collect_tiktok()
-        report.append(make_section("🎵 TIKTOK SƏSLƏRİ — TOP 10", sounds))
-        report.append("")
-        report.append(make_section("#️⃣ TIKTOK HASHTAG-LARI — TOP 10", hashtags))
-    except Exception as error:
-        report.append("TikTok məlumatları əldə edilmədi.")
-        report.append(str(error)[:250])
-
-    report.append("")
-
-    try:
-        templates = collect_capcut()
-        report.append(make_section("🎬 CAPCUT ŞABLONLARI — TOP 10", templates))
-        report.append("")
-        report.append("Qeyd: CapCut siyahısı Türkiyə regionuna aid olduğu təsdiqlənməyən açıq kolleksiyadır.")
-    except Exception as error:
-        report.append("CapCut məlumatları əldə edilmədi.")
-        report.append(str(error)[:250])
-
-    report.append("")
-    report.append("Mənbələr:")
-    report.append(ENDLESS_URL)
-    report.append(CAPCUT_URL)
-
-    send_telegram("\n".join(report))
+    with urllib.request.urlopen(request, timeout=30) as response:
+        print(response.read().decode())
 
 if __name__ == "__main__":
     main()
-      
+    
