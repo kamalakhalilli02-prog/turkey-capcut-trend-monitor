@@ -1,98 +1,72 @@
 
-import os
-import json
-import urllib.request
+import re
 from html.parser import HTMLParser
+from urllib.request import Request, urlopen
+from urllib.parse import urljoin
 
-SITES = {
-    "ENDLESS": "https://endless.app/radar/tiktok/turkey",
-    "CAPCUT": "https://www.capcut.com/tr-tr/template"
-}
+URL = "https://www.capcut.com/tr-tr/template"
 
-class Parser(HTMLParser):
+class LinkParser(HTMLParser):
     def __init__(self):
         super().__init__()
         self.links = []
-        self.active = []
+        self.current = None
 
     def handle_starttag(self, tag, attrs):
         if tag == "a":
-            item = {"url": dict(attrs).get("href", ""), "text": ""}
-            self.active.append(item)
+            self.current = {
+                "url": dict(attrs).get("href", ""),
+                "text": ""
+            }
 
     def handle_data(self, data):
-        for item in self.active:
-            item["text"] += data
+        if self.current is not None:
+            self.current["text"] += data
 
     def handle_endtag(self, tag):
-        if tag == "a" and self.active:
-            item = self.active.pop()
-            self.links.append(item)
+        if tag == "a" and self.current is not None:
+            self.links.append(self.current)
+            self.current = None
 
-def main():
-    report = ["🔎 TREND LINK TESTİ"]
+print("🔎 CAPCUT ŞABLON TESTİ")
+print("Səhifə yoxlanılır...\n")
 
-    for name, url in SITES.items():
-        try:
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "Mozilla/5.0"}
-            )
-            with urllib.request.urlopen(req, timeout=30) as response:
-                html = response.read().decode("utf-8", errors="replace")
+try:
+    req = Request(URL, headers={
+        "User-Agent": "Mozilla/5.0"
+    })
 
-            parser = Parser()
-            parser.feed(html)
+    with urlopen(req, timeout=30) as response:
+        html = response.read().decode("utf-8", errors="ignore")
 
-            if name == "ENDLESS":
-                groups = {
-                    "TikTok music": lambda x: "tiktok.com/music/" in x,
-                    "TikTok tag": lambda x: "tiktok.com/tag/" in x
-                }
-            else:
-                groups = {
-                    "CapCut template": lambda x: "template" in x.lower()
-                }
+    parser = LinkParser()
+    parser.feed(html)
 
-            report.append(f"\n{name}: {len(html)} simvol")
-
-            for title, check in groups.items():
-                found = [x for x in parser.links if check(x["url"])]
-                report.append(f"\n{title}: {len(found)} link")
-
-                for item in found[:5]:
-                    report.append(
-                        f"- {item['text'].strip()[:70]}\n{item['url'][:180]}"
-                    )
-
-            if name == "ENDLESS":
-                for phrase in [
-                    "Trending sounds and songs this week",
-                    "Trending hashtags this week"
-                ]:
-                    report.append(
-                        f"{phrase}: {'VAR' if phrase in html else 'TAPILMADI'}"
-                    )
-
-        except Exception as error:
-            report.append(f"\n{name}: XƏTA: {str(error)[:200]}")
-
-    data = json.dumps({
-        "chat_id": os.environ["TELEGRAM_CHAT_ID"],
-        "text": "\n".join(report)
-    }).encode()
-
-    request = urllib.request.Request(
-        "https://api.telegram.org/bot"
-        + os.environ["TELEGRAM_BOT_TOKEN"]
-        + "/sendMessage",
-        data=data,
-        headers={"Content-Type": "application/json"}
+    trends = []
+    pattern = re.compile(
+        r"\d+(?:\.\d+)?[KMB]?·\d{2}:\d{2}"
     )
 
-    with urllib.request.urlopen(request, timeout=30) as response:
-        print(response.read().decode())
+    for item in parser.links:
+        name = " ".join(item["text"].split())
 
-if __name__ == "__main__":
-    main()
+        if pattern.search(name) and item["url"]:
+            link = urljoin(URL, item["url"])
+
+            if link not in [x["link"] for x in trends]:
+                trends.append({
+                    "name": name,
+                    "link": link
+                })
+
+    print("Səhifə ölçüsü:", len(html), "simvol")
+    print("Tapılan konkret şablonlar:", len(trends))
+    print("\n📌 ŞABLONLAR:\n")
+
+    for i, item in enumerate(trends[:30], 1):
+        print(f"{i}. {item['name']}")
+        print(item["link"])
+
+except Exception as e:
+    print("XƏTA:", str(e))
     
