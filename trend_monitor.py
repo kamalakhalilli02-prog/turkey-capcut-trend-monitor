@@ -6,7 +6,7 @@ from html.parser import HTMLParser
 
 SITES = {
     "ENDLESS": "https://endless.app/radar/tiktok/turkey",
-    "CAPCUT": "https://www.capcut.com/tr-tr/explore/CapCut-yeni-trendler/7512833274387318785"
+    "CAPCUT": "https://www.capcut.com/tr-tr/template"
 }
 
 class Parser(HTMLParser):
