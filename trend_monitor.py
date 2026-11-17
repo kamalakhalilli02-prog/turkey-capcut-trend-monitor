@@ -1,23 +1,31 @@
+
 import os
 import json
 import re
 import urllib.request
 from datetime import datetime, timezone, timedelta
 from html.parser import HTMLParser
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 SITES = {
     "ENDLESS": "https://endless.app/radar/tiktok/turkey",
-    "CAPCUT": "https://www.capcut.com/tr-tr/explore/turkish-templates"
+    "CAPCUT_PAGES": [
+        "https://www.capcut.com/tr-tr/explore/turkish-templates",
+        "https://www.capcut.com/explore/latest-trending-templates",
+        "https://www.capcut.com/explore/new-trending-on-CapCut",
+        "https://www.capcut.com/explore/Latest",
+        "https://www.capcut.com/template"
+    ]
 }
 
-# Sənin göndərdiyin test şablonu
-TEST_TEMPLATE = (
-    "https://www.capcut.com/template-detail/"
-    "erhanlyrics-capcutturkiye/7546996130886847797"
-)
+HISTORY_FILE = "capcut_history.json"
 
-MAX_TEMPLATES_TO_CHECK = 5
+DAYS_BACK = 30
+MAX_DETAILS_TO_CHECK = 35
+MAX_NEW_TO_REPORT = 15
+MAX_GROWTH_TO_REPORT = 10
+
+AZ_TZ = timezone(timedelta(hours=4))
 
 
 class Parser(HTMLParser):
@@ -28,9 +36,6 @@ class Parser(HTMLParser):
         self.text = []
         self.h1 = []
         self.in_h1 = False
-        self.scripts = []
-        self.in_script = False
-        self.current_script = []
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -44,16 +49,6 @@ class Parser(HTMLParser):
         if tag == "h1":
             self.in_h1 = True
 
-        if tag == "script":
-            self.in_script = True
-            self.current_script = []
-
-            self.scripts.append({
-                "id": attrs.get("id", ""),
-                "type": attrs.get("type", ""),
-                "content": ""
-            })
-
     def handle_data(self, data):
         self.text.append(data)
 
@@ -63,9 +58,6 @@ class Parser(HTMLParser):
         if self.in_h1:
             self.h1.append(data)
 
-        if self.in_script and self.scripts:
-            self.scripts[-1]["content"] += data
-
     def handle_endtag(self, tag):
         if tag == "a" and self.current_link is not None:
             self.links.append(self.current_link)
@@ -74,9 +66,6 @@ class Parser(HTMLParser):
         if tag == "h1":
             self.in_h1 = False
 
-        if tag == "script":
-            self.in_script = False
-
 
 def get_page(url):
     req = urllib.request.Request(
@@ -84,27 +73,170 @@ def get_page(url):
         headers={
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
             ),
             "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8"
         }
     )
 
-    with urllib.request.urlopen(req, timeout=30) as response:
+    with urllib.request.urlopen(req, timeout=35) as response:
         return response.read().decode(
             "utf-8",
             errors="replace"
         )
 
 
-def extract_number(patterns, text):
+def get_template_id(url):
+    path = urlparse(url).path.rstrip("/")
+    return path.split("/")[-1]
+
+
+def load_history():
+    if not os.path.exists(HISTORY_FILE):
+        return {
+            "reported": [],
+            "templates": {}
+        }
+
+    try:
+        with open(
+            HISTORY_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            data = json.load(file)
+
+        if not isinstance(data, dict):
+            raise ValueError("History formatı düzgün deyil")
+
+        data.setdefault("reported", [])
+        data.setdefault("templates", {})
+
+        return data
+
+    except Exception:
+        return {
+            "reported": [],
+            "templates": {}
+        }
+
+
+def save_history(history):
+    with open(
+        HISTORY_FILE,
+        "w",
+        encoding="utf-8"
+    ) as file:
+        json.dump(
+            history,
+            file,
+            ensure_ascii=False,
+            indent=2
+        )
+
+
+def extract_upload_date(html):
+    """
+    Əsas tarix sahəsi uploadDate-dir.
+    Ümumi createTime sahəsi dərc tarixi kimi istifadə edilmir.
+    """
+
+    patterns = [
+        r'["\']uploadDate["\']\s*:\s*["\']?(\d{10,13})',
+        r'["\']datePublished["\']\s*:\s*["\']?(\d{10,13})',
+        r'["\']uploadDate["\']\s*:\s*["\'](20\d{2}-\d{2}-\d{2})'
+    ]
+
     for pattern in patterns:
-        match = re.search(pattern, text, re.I)
+        match = re.search(pattern, html, re.I)
 
-        if match:
-            return match.group(1).strip()
+        if not match:
+            continue
 
-    return "Tapılmadı"
+        value = match.group(1)
+
+        try:
+            if value.isdigit():
+                timestamp = int(value)
+
+                if len(value) == 13:
+                    timestamp = timestamp / 1000
+
+                return datetime.fromtimestamp(
+                    timestamp,
+                    timezone.utc
+                ).astimezone(AZ_TZ)
+
+            return datetime.strptime(
+                value,
+                "%Y-%m-%d"
+            ).replace(tzinfo=AZ_TZ)
+
+        except (ValueError, OverflowError, OSError):
+            continue
+
+    return None
+
+
+def number_to_int(value):
+    if not value or value == "Tapılmadı":
+        return None
+
+    value = value.upper()
+    value = value.replace(" ", "")
+    value = value.replace(",", ".")
+
+    multiplier = 1
+
+    if value.endswith("K"):
+        multiplier = 1000
+        value = value[:-1]
+
+    elif value.endswith("M"):
+        multiplier = 1000000
+        value = value[:-1]
+
+    elif value.endswith("B"):
+        multiplier = 1000000000
+        value = value[:-1]
+
+    try:
+        return int(float(value) * multiplier)
+    except ValueError:
+        return None
+
+
+def format_number(number):
+    if number is None:
+        return "Tapılmadı"
+
+    if number >= 1000000:
+        return f"{number / 1000000:.2f}M"
+
+    if number >= 1000:
+        return f"{number / 1000:.2f}K"
+
+    return str(number)
+
+
+def extract_usage(text):
+    patterns = [
+        r'([\d.,]+\s*[KMB]?)\s*(?:uses|use)',
+        r'([\d.,]+\s*[KMB]?)\s*(?:kullanım|kullan)',
+        r'([\d.,]+\s*[KMB])'
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.I)
+
+        for value in matches:
+            number = number_to_int(value)
+
+            if number is not None:
+                return number
+
+    return None
 
 
 def inspect_template(url):
@@ -116,218 +248,82 @@ def inspect_template(url):
     page_text = " ".join(parser.text)
     title = " ".join(parser.h1).strip()
 
-    report = []
+    if not title:
+        title = "Başlıq tapılmadı"
 
-    report.append(
-        f"\n🔗 {url}"
-    )
+    upload_date = extract_upload_date(html)
+    usage = extract_usage(page_text)
 
-    report.append(
-        f"HTML ölçüsü: {len(html)} simvol"
-    )
+    return {
+        "id": get_template_id(url),
+        "url": url,
+        "title": title,
+        "date": upload_date,
+        "usage": usage
+    }
 
-    report.append(
-        f"Başlıq: {title or 'Tapılmadı'}"
-    )
 
-    # CapCut metadata markerləri
-    for marker in [
-        "MODERN_ROUTER_DATA",
-        "RENDER_DATA",
-        "createdAt",
-        "createTime",
-        "create_time",
-        "publishTime",
-        "publish_time"
-    ]:
-        report.append(
-            f"{marker}: "
-            f"{'VAR' if marker.lower() in html.lower() else 'YOX'}"
-        )
+def discover_templates(report):
+    found = []
+    seen = set()
 
-    # Script məlumatları
-    report.append(
-        f"Script sayı: {len(parser.scripts)}"
-    )
+    for page_url in SITES["CAPCUT_PAGES"]:
+        try:
+            html = get_page(page_url)
 
-    for script in parser.scripts:
-        script_id = script["id"]
-        script_type = script["type"]
-        content = script["content"]
+            parser = Parser()
+            parser.feed(html)
 
-        if (
-            "RENDER_DATA" in script_id
-            or "MODERN_ROUTER_DATA" in script_id
-            or "application/json" in script_type
-        ):
-            report.append(
-                f"Script ID: {script_id or 'Adsız'}"
-            )
+            page_count = 0
 
-            report.append(
-                f"Script ölçüsü: {len(content)}"
-            )
+            for item in parser.links:
+                link = urljoin(page_url, item["url"])
+                parsed = urlparse(link)
 
-    # Tarix formatlarını axtar
-    date_patterns = [
-        r"\b20\d{2}-\d{2}-\d{2}\b",
-        r"\b\d{2}[./]\d{2}[./]20\d{2}\b",
-        r"\b\d{2}-\d{2}-20\d{2}\b"
-    ]
+                if (
+                    "capcut.com" not in parsed.netloc
+                    or "/template-detail/" not in parsed.path
+                ):
+                    continue
 
-    found_dates = []
+                template_id = get_template_id(link)
 
-    for pattern in date_patterns:
-        matches = re.findall(
-            pattern,
-            html
-        )
+                if not template_id or template_id in seen:
+                    continue
 
-        for value in matches:
-            if value not in found_dates:
-                found_dates.append(value)
+                seen.add(template_id)
 
-    report.append(
-        "\n📅 TAPILAN TARİXLƏR:"
-    )
+                found.append({
+                    "url": link,
+                    "source": page_url,
+                    "anchor": item["text"].strip()
+                })
 
-    if found_dates:
-        for value in found_dates[:15]:
-            report.append(f"• {value}")
-    else:
-        report.append("Heç bir tarix tapılmadı.")
-
-    # Tarix sahələrinin yanında olan məlumatlar
-    report.append(
-        "\n🧩 TARİX METADATA SAHƏLƏRİ:"
-    )
-
-    field_patterns = [
-        r'["\']?(createdAt|createTime|create_time)["\']?\s*[:=]\s*["\']?([^,"\'\s}]+)',
-        r'["\']?(publishTime|publish_time)["\']?\s*[:=]\s*["\']?([^,"\'\s}]+)',
-        r'["\']?(datePublished|uploadDate)["\']?\s*[:=]\s*["\']?([^,"\'\s}]+)'
-    ]
-
-    field_found = False
-
-    for pattern in field_patterns:
-        matches = re.findall(
-            pattern,
-            html,
-            re.I
-        )
-
-        for field, value in matches[:5]:
-            field_found = True
+                page_count += 1
 
             report.append(
-                f"{field}: {value[:80]}"
+                f"• {page_url}: {page_count} yeni link"
             )
 
-    if not field_found:
-        report.append(
-            "Tarix sahəsi tapılmadı."
-        )
-
-    # Unix timestamp ehtimalı
-    report.append(
-        "\n⏱ TIMESTAMP MƏLUMATLARI:"
-    )
-
-    timestamp_patterns = [
-        r'["\']?(createTime|create_time|createdAt)["\']?\s*[:=]\s*["\']?(\d{10,13})',
-        r'["\']?(publishTime|publish_time)["\']?\s*[:=]\s*["\']?(\d{10,13})'
-    ]
-
-    timestamp_found = False
-
-    for pattern in timestamp_patterns:
-        matches = re.findall(
-            pattern,
-            html,
-            re.I
-        )
-
-        for field, value in matches[:5]:
-            try:
-                timestamp = int(value)
-
-                if len(value) == 13:
-                    timestamp = timestamp / 1000
-
-                converted = datetime.fromtimestamp(
-                    timestamp,
-                    timezone.utc
-                )
-
-                timestamp_found = True
-
-                report.append(
-                    f"{field}: "
-                    f"{converted.strftime('%Y-%m-%d %H:%M UTC')}"
-                )
-
-            except (ValueError, OverflowError, OSError):
-                pass
-
-    if not timestamp_found:
-        report.append(
-            "Timestamp tapılmadı."
-        )
-
-    # İstifadə və bəyənmə göstəriciləri
-    uses = extract_number([
-        r"([\d.,]+\s*[KMB]?)\s+uses",
-        r"([\d.,]+\s*[KMB]?)\s+kullanım"
-    ], page_text)
-
-    likes = extract_number([
-        r"([\d.,]+\s*[KMB]?)\s+likes",
-        r"([\d.,]+\s*[KMB]?)\s+beğeni"
-    ], page_text)
-
-    report.append(
-        f"\nİstifadə: {uses}"
-    )
-
-    report.append(
-        f"Bəyənmə: {likes}"
-    )
-
-    # Tarix ətrafındakı mətn nümunələri
-    report.append(
-        "\n🔬 TARİX ƏTRAFINDAKI HTML:"
-    )
-
-    for value in found_dates[:3]:
-        position = html.find(value)
-
-        if position >= 0:
-            start = max(0, position - 180)
-            end = min(
-                len(html),
-                position + 250
-            )
-
-            snippet = re.sub(
-                r"\s+",
-                " ",
-                html[start:end]
-            )
-
+        except Exception as error:
             report.append(
-                snippet[:450]
+                f"❌ Səhifə xətası: {page_url}\n"
+                f"{str(error)[:150]}"
             )
 
-    return "\n".join(report)
+    return found
 
 
 def main():
     report = [
-        "🔎 TÜRKİYƏ TREND DİAQNOSTİKASI"
+        "🔎 TÜRKİYƏ TREND HESABATI",
+        f"📅 Tarix: {datetime.now(AZ_TZ).strftime('%d.%m.%Y %H:%M')}"
     ]
 
-    # ENDLESS - əvvəlki işləyən hissə
+    # -----------------------------
+    # ENDLESS - MUSİQİ VƏ HASHTAG
+    # -----------------------------
+
     try:
         html = get_page(SITES["ENDLESS"])
 
@@ -350,10 +346,7 @@ def main():
             for item in parser.links:
                 link = item["url"]
 
-                if (
-                    marker in link
-                    and link not in seen
-                ):
+                if marker in link and link not in seen:
                     seen.add(link)
                     found.append(item)
 
@@ -377,71 +370,219 @@ def main():
             f"\n❌ ENDLESS xətası: {str(error)[:200]}"
         )
 
-    # CAPCUT - test
-    try:
-        capcut_html = get_page(SITES["CAPCUT"])
+    # -----------------------------
+    # CAPCUT - ÇOX MƏNBƏDƏN AXTARIŞ
+    # -----------------------------
 
-        capcut_parser = Parser()
-        capcut_parser.feed(capcut_html)
+    report.append("\n\n📌 CAPCUT ŞABLON AXTARIŞI")
+    report.append("Yoxlanılan mənbələr:")
 
-        templates = []
-        seen = set()
+    candidates = discover_templates(report)
 
-        for item in capcut_parser.links:
-            link = urljoin(
-                SITES["CAPCUT"],
-                item["url"]
+    report.append(
+        f"\nToplam unikal şablon linki: {len(candidates)}"
+    )
+
+    candidates = candidates[:MAX_DETAILS_TO_CHECK]
+
+    report.append(
+        f"Detallı yoxlanılacaq şablon: {len(candidates)}"
+    )
+
+    now = datetime.now(AZ_TZ)
+    cutoff = now - timedelta(days=DAYS_BACK)
+
+    history = load_history()
+    reported_ids = set(history.get("reported", []))
+    template_history = history.get("templates", {})
+
+    recent_templates = []
+    unknown_dates = 0
+    old_templates = 0
+    checked = 0
+
+    for candidate in candidates:
+        try:
+            item = inspect_template(candidate["url"])
+            checked += 1
+
+            if item["date"] is None:
+                unknown_dates += 1
+                continue
+
+            if not (cutoff <= item["date"] <= now):
+                old_templates += 1
+                continue
+
+            template_id = item["id"]
+            previous = template_history.get(
+                template_id,
+                {}
             )
 
+            previous_usage = previous.get("last_usage")
+            current_usage = item["usage"]
+
+            growth = None
+
             if (
-                "/template-detail/" in link
-                and link not in seen
+                previous_usage is not None
+                and current_usage is not None
             ):
-                seen.add(link)
-                templates.append(link)
+                growth = current_usage - previous_usage
 
-        report.append(
-            f"\n\n📌 CAPCUT"
-        )
+            item["growth"] = growth
+            item["previous_usage"] = previous_usage
 
-        report.append(
-            f"Tapılan şablon linkləri: {len(templates)}"
-        )
+            recent_templates.append(item)
 
-        # Əvvəl konkret sənin göndərdiyin linki yoxla
-        test_links = [TEST_TEMPLATE]
+            # Tarixçə məlumatlarını yenilə
+            if template_id not in template_history:
+                template_history[template_id] = {
+                    "title": item["title"],
+                    "url": item["url"],
+                    "upload_date": item["date"].isoformat(),
+                    "first_seen": now.isoformat(),
+                    "daily_usage": []
+                }
 
-        # Sonra siyahıdan ilk 4 şablon
-        for link in templates:
-            if link not in test_links:
-                test_links.append(link)
+            record = template_history[template_id]
 
-            if len(test_links) >= MAX_TEMPLATES_TO_CHECK:
-                break
+            record["title"] = item["title"]
+            record["url"] = item["url"]
+            record["upload_date"] = item["date"].isoformat()
 
-        for index, link in enumerate(test_links, 1):
-            try:
-                report.append(
-                    f"\n\n========== ŞABLON {index} =========="
+            if current_usage is not None:
+                record["last_usage"] = current_usage
+
+                daily_usage = record.setdefault(
+                    "daily_usage",
+                    []
                 )
 
-                report.append(
-                    inspect_template(link)
-                )
+                today = now.strftime("%Y-%m-%d")
 
-            except Exception as error:
-                report.append(
-                    f"\n❌ Şablon xətası: {str(error)[:200]}"
-                )
+                if not daily_usage or daily_usage[-1].get("date") != today:
+                    daily_usage.append({
+                        "date": today,
+                        "usage": current_usage
+                    })
 
-    except Exception as error:
+                record["daily_usage"] = daily_usage[-30:]
+
+        except Exception as error:
+            report.append(
+                f"\n⚠️ Şablon yoxlanmadı: "
+                f"{str(error)[:120]}"
+            )
+
+    # İstifadə sayına görə sıralama
+    recent_templates.sort(
+        key=lambda x: (
+            x["usage"] is not None,
+            x["usage"] or 0
+        ),
+        reverse=True
+    )
+
+    report.append("\n📊 YOXLAMA NƏTİCƏSİ")
+    report.append(f"Yoxlanılan: {checked}")
+    report.append(f"Tarixi tapılmayan: {unknown_dates}")
+    report.append(f"30 gündən köhnə: {old_templates}")
+    report.append(
+        f"Son 30 gündə yayımlanan: {len(recent_templates)}"
+    )
+
+    # İlk dəfə tapılan şablonlar
+    new_templates = [
+        item for item in recent_templates
+        if item["id"] not in reported_ids
+    ]
+
+    report.append("\n🆕 YENİ TAPILAN ŞABLONLAR")
+
+    if new_templates:
+        for index, item in enumerate(
+            new_templates[:MAX_NEW_TO_REPORT],
+            1
+        ):
+            report.append(
+                f"\n{index}. {item['title']}"
+            )
+            report.append(
+                f"📅 Tarix: {item['date'].strftime('%d.%m.%Y')}"
+            )
+            report.append(
+                f"🔥 İstifadə: {format_number(item['usage'])}"
+            )
+            report.append(item["url"])
+
+            reported_ids.add(item["id"])
+
+    else:
         report.append(
-            f"\n❌ CAPCUT xətası: {str(error)[:200]}"
+            "Bu gün yeni və uyğun şablon tapılmadı."
         )
 
+    # İstifadəsi artan şablonlar
+    growth_templates = [
+        item for item in recent_templates
+        if item["growth"] is not None and item["growth"] > 0
+    ]
+
+    growth_templates.sort(
+        key=lambda x: x["growth"],
+        reverse=True
+    )
+
+    report.append("\n📈 İSTİFADƏSİ ARTAN ŞABLONLAR")
+
+    if growth_templates:
+        for index, item in enumerate(
+            growth_templates[:MAX_GROWTH_TO_REPORT],
+            1
+        ):
+            report.append(
+                f"\n{index}. {item['title']}"
+            )
+            report.append(
+                f"İndiki istifadə: {format_number(item['usage'])}"
+            )
+            report.append(
+                f"Əvvəlki göstəricidən artım: "
+                f"+{format_number(item['growth'])}"
+            )
+            report.append(item["url"])
+
+    else:
+        report.append(
+            "Müqayisə üçün əvvəlki günlük göstərici yoxdur "
+            "və ya artım qeydə alınmayıb."
+        )
+
+    # Tarix tapılmayan şablonlarla bağlı xəbərdarlıq
+    if unknown_dates:
+        report.append(
+            "\n⚠️ Qeyd: Tarixi tapılmayan şablonlar "
+            "30 günlük siyahıya daxil edilməyib."
+        )
+
+    history["reported"] = list(reported_ids)
+    history["templates"] = template_history
+
+    save_history(history)
+
+    # -----------------------------
     # TELEGRAM
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
-    chat_id = os.environ["TELEGRAM_CHAT_ID"]
+    # -----------------------------
+
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+
+    if not token or not chat_id:
+        raise RuntimeError(
+            "Telegram secret-ləri tapılmadı."
+        )
 
     message = "\n".join(report)
 
