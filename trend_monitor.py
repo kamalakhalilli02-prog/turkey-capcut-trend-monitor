@@ -3,6 +3,7 @@ import os
 import json
 import re
 import urllib.request
+from datetime import datetime, timedelta, timezone, date
 from html.parser import HTMLParser
 from urllib.parse import urljoin
 
@@ -10,6 +11,11 @@ SITES = {
     "ENDLESS": "https://endless.app/radar/tiktok/turkey",
     "CAPCUT": "https://www.capcut.com/tr-tr/explore/turkish-templates"
 }
+
+HISTORY_FILE = "capcut_history.json"
+AZ_TZ = timezone(timedelta(hours=4))
+DAYS_LIMIT = 30
+MAX_TEMPLATES_TO_CHECK = 40
 
 
 class Parser(HTMLParser):
@@ -27,6 +33,7 @@ class Parser(HTMLParser):
                 "url": dict(attrs).get("href", ""),
                 "text": ""
             }
+
         if tag == "h1":
             self.in_h1 = True
 
@@ -63,10 +70,37 @@ def get_page(url):
 def extract_number(patterns, text):
     for pattern in patterns:
         match = re.search(pattern, text, re.I)
+
         if match:
             return match.group(1).strip()
 
     return "Tapılmadı"
+
+
+def parse_usage(value):
+    if not value or value == "Tapılmadı":
+        return 0
+
+    value = value.replace(",", ".").strip().upper()
+    multiplier = 1
+
+    if value.endswith("K"):
+        multiplier = 1_000
+        value = value[:-1]
+
+    elif value.endswith("M"):
+        multiplier = 1_000_000
+        value = value[:-1]
+
+    elif value.endswith("B"):
+        multiplier = 1_000_000_000
+        value = value[:-1]
+
+    try:
+        return int(float(value) * multiplier)
+
+    except ValueError:
+        return 0
 
 
 def get_template_details(url):
@@ -76,23 +110,277 @@ def get_template_details(url):
     parser.feed(html)
 
     page_text = " ".join(parser.text)
-
     title = " ".join(parser.h1).strip()
 
     if not title:
         title = "Şablon adı tapılmadı"
 
+    # Yayımlanma tarixini tap
+    date_match = re.search(
+        r"\b(20\d{2}-\d{2}-\d{2})\b",
+        page_text
+    )
+
+    created_at = None
+
+    if date_match:
+        try:
+            created_at = datetime.strptime(
+                date_match.group(1),
+                "%Y-%m-%d"
+            ).date()
+
+        except ValueError:
+            pass
+
+    # İstifadə sayı
     uses = extract_number([
         r"([\d.,]+\s*[KMB]?)\s+uses",
         r"([\d.,]+\s*[KMB]?)\s+kullanım"
     ], page_text)
 
+    # Bəyənmə sayı
     likes = extract_number([
         r"([\d.,]+\s*[KMB]?)\s+likes",
         r"([\d.,]+\s*[KMB]?)\s+beğeni"
     ], page_text)
 
-    return title, uses, likes
+    return title, uses, likes, created_at
+
+
+def load_history():
+    if not os.path.exists(HISTORY_FILE):
+        return {}
+
+    try:
+        with open(
+            HISTORY_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            return json.load(file)
+
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_history(history):
+    with open(
+        HISTORY_FILE,
+        "w",
+        encoding="utf-8"
+    ) as file:
+        json.dump(
+            history,
+            file,
+            ensure_ascii=False,
+            indent=2
+        )
+
+
+def get_template_id(url):
+    match = re.search(r"/(\d+)(?:[/?#]|$)", url)
+
+    if match:
+        return match.group(1)
+
+    return url
+
+
+def update_template_history(history, template_id, uses):
+    today = datetime.now(AZ_TZ).date()
+    current_usage = parse_usage(uses)
+
+    if current_usage <= 0:
+        return None
+
+    item = history.get(template_id, {
+        "snapshots": []
+    })
+
+    snapshots = item.get("snapshots", [])
+
+    previous = None
+
+    for snapshot in reversed(snapshots):
+        if snapshot.get("date") != today.isoformat():
+            previous = snapshot
+            break
+
+    growth = None
+    daily_growth = None
+
+    if previous:
+        old_usage = previous.get("uses", 0)
+        old_date = date.fromisoformat(previous["date"])
+
+        days = max((today - old_date).days, 1)
+
+        growth = current_usage - old_usage
+        daily_growth = round(growth / days)
+
+    # Eyni günün təkrar ölçməsini yenilə
+    today_snapshot = {
+        "date": today.isoformat(),
+        "uses": current_usage
+    }
+
+    if snapshots and snapshots[-1].get("date") == today.isoformat():
+        snapshots[-1] = today_snapshot
+    else:
+        snapshots.append(today_snapshot)
+
+    # Tarixçəni çox böyüməsin deyə məhdudlaşdır
+    item["snapshots"] = snapshots[-60:]
+
+    history[template_id] = item
+
+    return {
+        "growth": growth,
+        "daily_growth": daily_growth
+    }
+
+
+def get_capcut_trends(report):
+    today = datetime.now(AZ_TZ).date()
+    cutoff = today - timedelta(days=DAYS_LIMIT)
+
+    history = load_history()
+
+    capcut_url = SITES["CAPCUT"]
+    html = get_page(capcut_url)
+
+    parser = Parser()
+    parser.feed(html)
+
+    report.append(
+        f"\n\n📌 CAPCUT: {len(html)} simvol"
+    )
+
+    templates = []
+    seen = set()
+
+    for item in parser.links:
+        link = urljoin(capcut_url, item["url"])
+        name = " ".join(item["text"].split())
+
+        if (
+            "/template-detail/" in link
+            and link not in seen
+        ):
+            seen.add(link)
+
+            templates.append({
+                "name": name,
+                "link": link
+            })
+
+    report.append(
+        f"\n🔍 Tapılan şablon linkləri: {len(templates)}"
+    )
+
+    recent_templates = []
+
+    for item in templates[:MAX_TEMPLATES_TO_CHECK]:
+        try:
+            title, uses, likes, created_at = (
+                get_template_details(item["link"])
+            )
+
+            # Tarix təsdiqlənməyibsə qəbul etmə
+            if created_at is None:
+                continue
+
+            # Son 30 gündən köhnədirsə qəbul etmə
+            if not (cutoff <= created_at <= today):
+                continue
+
+            template_id = get_template_id(item["link"])
+
+            growth_info = update_template_history(
+                history,
+                template_id,
+                uses
+            )
+
+            recent_templates.append({
+                "title": title or item["name"],
+                "uses": uses,
+                "usage_number": parse_usage(uses),
+                "likes": likes,
+                "created_at": created_at,
+                "link": item["link"],
+                "growth": growth_info
+            })
+
+        except Exception as error:
+            print(
+                "Şablon oxunmadı:",
+                str(error)[:150]
+            )
+
+    save_history(history)
+
+    # Əvvəl gündəlik artımı məlum olanları,
+    # sonra istifadə sayını nəzərə al
+    recent_templates.sort(
+        key=lambda x: (
+            x["growth"] is not None
+            and x["growth"]["daily_growth"] is not None,
+            (
+                x["growth"]["daily_growth"]
+                if x["growth"]
+                and x["growth"]["daily_growth"] is not None
+                else x["usage_number"]
+            ),
+            x["usage_number"]
+        ),
+        reverse=True
+    )
+
+    report.append(
+        f"\n🆕 Son 30 gündə yayımlananlar: "
+        f"{len(recent_templates)}"
+    )
+
+    for i, item in enumerate(recent_templates[:10], 1):
+        growth = item["growth"]
+
+        if growth and growth["daily_growth"] is not None:
+            growth_text = (
+                f"Gündəlik artım: "
+                f"{growth['daily_growth']:+,} istifadə/gün"
+            )
+        else:
+            growth_text = (
+                "Gündəlik artım: Hələ ölçülməyib "
+                "(ilk müşahidə)"
+            )
+
+        report.append(
+            f"\n{i}. {item['title'][:100]}\n"
+            f"Yayımlanma: {item['created_at']}\n"
+            f"İstifadə: {item['uses']}\n"
+            f"Bəyənmə: {item['likes']}\n"
+            f"{growth_text}\n"
+            f"{item['link']}"
+        )
+
+    if not recent_templates:
+        report.append(
+            "\nSon 30 gündə yayımlanması "
+            "təsdiqlənən şablon tapılmadı."
+        )
+
+    report.append(
+        "\nQeyd: Tarixi təsdiqlənməyən şablonlar "
+        "siyahıya daxil edilmir."
+    )
+
+    report.append(
+        "İlk ölçmədə artım göstəricisi olmur. "
+        "Müqayisə üçün növbəti günlük ölçmə lazımdır."
+    )
 
 
 def main():
@@ -130,7 +418,10 @@ def main():
             )
 
             for item in found[:10]:
-                name = item["text"].strip() or "Ad göstərilmir"
+                name = (
+                    item["text"].strip()
+                    or "Ad göstərilmir"
+                )
 
                 report.append(
                     f"• {name[:80]}\n"
@@ -153,70 +444,7 @@ def main():
 
     # CAPCUT
     try:
-        capcut_url = SITES["CAPCUT"]
-        html = get_page(capcut_url)
-
-        parser = Parser()
-        parser.feed(html)
-
-        report.append(
-            f"\n\n📌 CAPCUT: {len(html)} simvol"
-        )
-
-        templates = []
-        seen = set()
-
-        for item in parser.links:
-            link = urljoin(capcut_url, item["url"])
-            name = " ".join(item["text"].split())
-
-            if (
-                "/template-detail/" in link
-                and link not in seen
-            ):
-                seen.add(link)
-
-                templates.append({
-                    "name": name,
-                    "link": link
-                })
-
-        report.append(
-            f"\n🎬 Konkret şablonlar: {len(templates)}"
-        )
-
-        for i, item in enumerate(templates[:10], 1):
-            try:
-                title, uses, likes = get_template_details(
-                    item["link"]
-                )
-
-                if title == "Şablon adı tapılmadı":
-                    title = item["name"] or title
-
-                report.append(
-                    f"\n{i}. {title[:100]}\n"
-                    f"İstifadə: {uses}\n"
-                    f"Bəyənmə: {likes}\n"
-                    f"{item['link']}"
-                )
-
-            except Exception as error:
-                report.append(
-                    f"\n{i}. {item['name'] or 'Şablon'}\n"
-                    f"Məlumat oxunmadı: {str(error)[:100]}\n"
-                    f"{item['link']}"
-                )
-
-        if not templates:
-            report.append(
-                "Konkret şablon linkləri tapılmadı."
-            )
-
-        report.append(
-            "\nQeyd: İstifadə sayı CapCut səhifəsində "
-            "göstərilən ümumi göstəricidir."
-        )
+        get_capcut_trends(report)
 
     except Exception as error:
         report.append(
@@ -256,3 +484,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
