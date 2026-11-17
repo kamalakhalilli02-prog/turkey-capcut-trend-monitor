@@ -8,7 +8,9 @@ import urllib.request
 
 from datetime import datetime, timezone, timedelta
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlparse, quote
+from urllib.parse import urljoin, urlparse
+
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
 # =====================================================
@@ -16,6 +18,7 @@ from urllib.parse import urljoin, urlparse, quote
 # =====================================================
 
 ENDLESS_URL = "https://endless.app/radar/tiktok/turkey"
+CAPCUT_URL = "https://www.capcut.com/template"
 
 HISTORY_FILE = "capcut_history.json"
 
@@ -39,7 +42,6 @@ class Parser(HTMLParser):
 
     def __init__(self):
         super().__init__()
-
         self.links = []
         self.current_link = None
         self.text = []
@@ -82,15 +84,8 @@ def get_page(url):
         }
     )
 
-    with urllib.request.urlopen(
-        request,
-        timeout=35
-    ) as response:
-
-        return response.read().decode(
-            "utf-8",
-            errors="replace"
-        )
+    with urllib.request.urlopen(request, timeout=35) as response:
+        return response.read().decode("utf-8", errors="replace")
 
 
 # =====================================================
@@ -106,13 +101,7 @@ def load_history():
         }
 
     try:
-
-        with open(
-            HISTORY_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
+        with open(HISTORY_FILE, "r", encoding="utf-8") as file:
             data = json.load(file)
 
         if not isinstance(data, dict):
@@ -124,7 +113,6 @@ def load_history():
         return data
 
     except Exception:
-
         return {
             "templates": {},
             "sound_matches": {}
@@ -133,12 +121,7 @@ def load_history():
 
 def save_history(history):
 
-    with open(
-        HISTORY_FILE,
-        "w",
-        encoding="utf-8"
-    ) as file:
-
+    with open(HISTORY_FILE, "w", encoding="utf-8") as file:
         json.dump(
             history,
             file,
@@ -155,21 +138,14 @@ def normalize_text(value):
 
     value = str(value or "").casefold()
 
-    value = unicodedata.normalize(
-        "NFKD",
-        value
-    )
+    value = unicodedata.normalize("NFKD", value)
 
     value = "".join(
         char for char in value
         if not unicodedata.combining(char)
     )
 
-    value = re.sub(
-        r"[^a-z0-9\s]",
-        " ",
-        value
-    )
+    value = re.sub(r"[^a-z0-9\s]", " ", value)
 
     return " ".join(value.split())
 
@@ -178,33 +154,23 @@ def clean_sound_name(name):
 
     name = str(name or "").strip()
 
-    name = re.sub(
-        r"^\s*original\s+sound\s*[-–—:]\s*",
-        "",
+    # Original sound adları mahnı adı deyil.
+    if re.match(
+        r"^\s*original\s+(sound|audio)\s*[-–—:]",
         name,
-        flags=re.I
-    )
+        re.I
+    ):
+        return ""
 
-    name = re.sub(
-        r"^\s*original\s+audio\s*[-–—:]\s*",
-        "",
-        name,
-        flags=re.I
-    )
-
-    name = name.strip(" .-_")
-
-    generic = [
+    if normalize_text(name) in [
         "original sound",
         "original audio",
         "orijinal ses",
         "orijinal ses kaydi"
-    ]
-
-    if normalize_text(name) in generic:
+    ]:
         return ""
 
-    return name
+    return name.strip(" .-_")
 
 
 # =====================================================
@@ -218,9 +184,7 @@ def get_endless_data(report):
     parser = Parser()
     parser.feed(html)
 
-    report.append(
-        f"\n📌 ENDLESS: {len(html)} simvol"
-    )
+    report.append(f"\n📌 ENDLESS: {len(html)} simvol")
 
     music = []
     hashtags = []
@@ -236,7 +200,6 @@ def get_endless_data(report):
         if "tiktok.com/music/" in link:
 
             if link not in seen_music:
-
                 seen_music.add(link)
 
                 music.append({
@@ -248,7 +211,6 @@ def get_endless_data(report):
         elif "tiktok.com/tag/" in link:
 
             if link not in seen_tags:
-
                 seen_tags.add(link)
 
                 hashtags.append({
@@ -257,68 +219,6 @@ def get_endless_data(report):
                 })
 
     return music, hashtags
-
-
-# =====================================================
-# CAPCUT AXTARIŞ URL
-# =====================================================
-
-def make_capcut_search_url(sound_name):
-
-    # Axtarış ifadəsini URL üçün uyğun formaya salırıq.
-    slug = "-".join(
-        normalize_text(sound_name).split()
-    )
-
-    return (
-        "https://www.capcut.com/explore/"
-        + quote(slug, safe="-")
-    )
-
-
-# =====================================================
-# CAPCUT ŞABLON LINKLƏRİNİN TAPILMASI
-# =====================================================
-
-def find_template_links(search_url):
-
-    html = get_page(search_url)
-
-    parser = Parser()
-    parser.feed(html)
-
-    found = []
-    seen = set()
-
-    for item in parser.links:
-
-        link = urljoin(
-            search_url,
-            item.get("url", "")
-        )
-
-        parsed = urlparse(link)
-
-        if "capcut.com" not in parsed.netloc:
-            continue
-
-        if "/template-detail/" not in parsed.path:
-            continue
-
-        template_id = parsed.path.rstrip("/").split("/")[-1]
-
-        if not template_id or template_id in seen:
-            continue
-
-        seen.add(template_id)
-
-        found.append({
-            "id": template_id,
-            "url": link,
-            "anchor": item.get("text", "").strip()
-        })
-
-    return found
 
 
 # =====================================================
@@ -336,11 +236,7 @@ def extract_upload_date(html):
 
     for pattern in patterns:
 
-        match = re.search(
-            pattern,
-            html,
-            re.I
-        )
+        match = re.search(pattern, html, re.I)
 
         if not match:
             continue
@@ -368,19 +264,12 @@ def extract_upload_date(html):
                     "%Y-%m-%d"
                 ).replace(tzinfo=AZ_TZ)
 
-            now = datetime.now(AZ_TZ)
-
-            # Gələcək tarixləri qəbul etmirik.
-            if date > now:
+            if date > datetime.now(AZ_TZ):
                 continue
 
             return date
 
-        except (
-            ValueError,
-            OverflowError,
-            OSError
-        ):
+        except (ValueError, OverflowError, OSError):
             continue
 
     return None
@@ -396,8 +285,7 @@ def number_to_int(value):
         return None
 
     value = str(value).upper()
-    value = value.replace(" ", "")
-    value = value.replace(",", ".")
+    value = value.replace(" ", "").replace(",", ".")
 
     multiplier = 1
 
@@ -444,11 +332,7 @@ def extract_usage(text):
 
     for pattern in patterns:
 
-        matches = re.findall(
-            pattern,
-            text,
-            re.I
-        )
+        matches = re.findall(pattern, text, re.I)
 
         for value in matches:
 
@@ -461,15 +345,13 @@ def extract_usage(text):
 
 
 # =====================================================
-# ŞABLONDA MUSİQİ METADATA-SININ TAPILMASI
+# AUDIO METADATA
 # =====================================================
 
 def extract_audio_labels(html):
 
     labels = []
 
-    # Yalnız musiqi/audio ilə əlaqəli açıq metadata
-    # sahələrini axtarırıq.
     fields = [
         "musicName",
         "music_name",
@@ -493,11 +375,7 @@ def extract_audio_labels(html):
             + r'["\']\s*:\s*["\']([^"\']{2,150})'
         )
 
-        matches = re.findall(
-            pattern,
-            html,
-            re.I
-        )
+        matches = re.findall(pattern, html, re.I)
 
         for value in matches:
 
@@ -525,7 +403,6 @@ def audio_matches(sound_name, audio_labels):
         if not candidate:
             continue
 
-        # Tam ifadə uyğunluğu
         if target == candidate:
             return True
 
@@ -534,9 +411,7 @@ def audio_matches(sound_name, audio_labels):
 
         candidate_words = set(candidate.split())
 
-        # Çoxsözlü adlarda bütün əsas sözlər uyğun gəlməlidir.
         if len(target_words) >= 2:
-
             if target_words.issubset(candidate_words):
                 return True
 
@@ -544,19 +419,130 @@ def audio_matches(sound_name, audio_labels):
 
 
 # =====================================================
-# ŞABLON DETALLARININ YOXLANMASI
+# PLAYWRIGHT - CAPCUT AXTARIŞI
 # =====================================================
 
-def inspect_template(candidate, sound_name):
+def find_search_box(page):
 
-    html = get_page(candidate["url"])
+    selectors = [
+        'input[type="search"]',
+        'input[placeholder*="Search" i]',
+        'input[placeholder*="template" i]',
+        'input[placeholder*="search" i]',
+        'input[aria-label*="search" i]',
+        'input'
+    ]
 
-    parser = Parser()
-    parser.feed(html)
+    for selector in selectors:
 
-    page_text = " ".join(parser.text)
+        locator = page.locator(selector)
 
-    title = page_text.split("\n")[0].strip()
+        try:
+            count = min(locator.count(), 10)
+
+            for index in range(count):
+
+                field = locator.nth(index)
+
+                if field.is_visible() and field.is_enabled():
+                    return field
+
+        except Exception:
+            continue
+
+    return None
+
+
+def find_template_links(page, sound_name):
+
+    page.goto(
+        CAPCUT_URL,
+        wait_until="domcontentloaded",
+        timeout=60000
+    )
+
+    page.wait_for_timeout(5000)
+
+    search_box = find_search_box(page)
+
+    if search_box is None:
+        raise RuntimeError(
+            "CapCut səhifəsində axtarış sahəsi tapılmadı. "
+            "Səhifənin quruluşu dəyişmiş ola bilər."
+        )
+
+    search_box.fill(sound_name)
+    search_box.press("Enter")
+
+    page.wait_for_timeout(6000)
+
+    # Axtarışdan sonra səhifənin linklərini götürürük.
+    links = page.locator("a").evaluate_all(
+        """elements => elements.map(a => ({
+            href: a.href,
+            text: (a.innerText || a.textContent || "").trim()
+        }))"""
+    )
+
+    found = []
+    seen = set()
+
+    for item in links:
+
+        link = item.get("href", "")
+
+        if not link:
+            continue
+
+        parsed = urlparse(link)
+
+        if "capcut.com" not in parsed.netloc:
+            continue
+
+        if "/template-detail/" not in parsed.path:
+            continue
+
+        template_id = parsed.path.rstrip("/").split("/")[-1]
+
+        if not template_id or template_id in seen:
+            continue
+
+        seen.add(template_id)
+
+        found.append({
+            "id": template_id,
+            "url": link,
+            "anchor": item.get("text", "")
+        })
+
+    return found
+
+
+# =====================================================
+# ŞABLON DETALLARININ YOXLanMASI
+# =====================================================
+
+def inspect_template(page, candidate, sound_name):
+
+    page.goto(
+        candidate["url"],
+        wait_until="domcontentloaded",
+        timeout=60000
+    )
+
+    page.wait_for_timeout(2500)
+
+    html = page.content()
+
+    try:
+        page_text = page.locator("body").inner_text(timeout=10000)
+    except Exception:
+        page_text = ""
+
+    try:
+        title = page.locator("h1").first.inner_text(timeout=3000)
+    except Exception:
+        title = candidate.get("anchor") or "Başlıq tapılmadı"
 
     if not title:
         title = candidate.get("anchor") or "Başlıq tapılmadı"
@@ -585,259 +571,230 @@ def inspect_template(candidate, sound_name):
 
 def search_capcut_for_sounds(music, report, history):
 
-    results = []
-
     report.append(
         "\n\n🎬 CAPCUT - TREND SƏSLƏRƏ UYĞUN ŞABLONLAR"
     )
 
-    for index, sound in enumerate(
-        music[:MAX_SOUNDS],
-        1
-    ):
+    with sync_playwright() as playwright:
 
-        sound_name = sound["name"]
-        search_name = sound["search_name"]
-
-        report.append(
-            f"\n\n{'─' * 25}"
+        browser = playwright.chromium.launch(
+            headless=True,
+            args=["--no-sandbox"]
         )
 
-        report.append(
-            f"🎵 {index}. {sound_name}"
+        page = browser.new_page(
+            user_agent=USER_AGENT,
+            locale="tr-TR"
         )
 
-        report.append(
-            f"🔗 TikTok səsi: {sound['url']}"
-        )
-
-        if not search_name:
-
-            report.append(
-                "⚠️ Səsin axtarış üçün konkret adı yoxdur. "
-                "CapCut axtarışı buraxıldı."
-            )
-
-            continue
-
-        report.append(
-            f"🔎 CapCut axtarışı: {search_name}"
-        )
-
-        search_url = make_capcut_search_url(
-            search_name
-        )
+        page.set_default_timeout(15000)
 
         try:
 
-            candidates = find_template_links(
-                search_url
-            )
+            for index, sound in enumerate(music[:MAX_SOUNDS], 1):
 
-            report.append(
-                f"Tapılan şablon linkləri: {len(candidates)}"
-            )
+                sound_name = sound["name"]
+                search_name = sound["search_name"]
 
-        except Exception as error:
+                report.append(f"\n\n{'─' * 25}")
+                report.append(f"🎵 {index}. {sound_name}")
+                report.append(f"🔗 TikTok səsi: {sound['url']}")
 
-            report.append(
-                f"❌ CapCut axtarış xətası: "
-                f"{str(error)[:150]}"
-            )
+                if not search_name:
 
-            continue
+                    report.append(
+                        "⚠️ Original sound və ya konkret adı olmayan səsdir. "
+                        "Mahnı adı kimi axtarılmadı."
+                    )
 
-        candidates = candidates[:MAX_DETAILS_PER_SOUND]
+                    continue
 
-        confirmed_templates = []
+                report.append(f"🔎 CapCut axtarışı: {search_name}")
 
-        for candidate in candidates:
+                try:
 
-            try:
+                    candidates = find_template_links(
+                        page,
+                        search_name
+                    )
 
-                item = inspect_template(
-                    candidate,
-                    search_name
-                )
+                    report.append(
+                        f"Tapılan şablon linkləri: {len(candidates)}"
+                    )
 
-                if item["confirmed"]:
+                except Exception as error:
 
-                    confirmed_templates.append(item)
+                    report.append(
+                        "❌ CapCut brauzer axtarış xətası: "
+                        + str(error)[:180]
+                    )
 
-                time.sleep(0.4)
+                    continue
 
-            except Exception as error:
+                candidates = candidates[:MAX_DETAILS_PER_SOUND]
 
-                report.append(
-                    f"⚠️ Şablon yoxlanmadı: "
-                    f"{str(error)[:100]}"
-                )
+                confirmed_templates = []
 
-        report.append(
-            f"Təsdiqlənmiş uyğun şablon: "
-            f"{len(confirmed_templates)}"
-        )
+                for candidate in candidates:
 
-        if not confirmed_templates:
+                    try:
 
-            report.append(
-                "❌ Səslə uyğunluğu metadata əsasında "
-                "təsdiqlənən şablon tapılmadı."
-            )
+                        item = inspect_template(
+                            page,
+                            candidate,
+                            search_name
+                        )
 
-            continue
+                        if item["confirmed"]:
+                            confirmed_templates.append(item)
 
-        # ƏN POPULYAR
-        popular_candidates = [
-            item for item in confirmed_templates
-            if item["usage"] is not None
-        ]
+                        time.sleep(0.5)
 
-        if popular_candidates:
+                    except PlaywrightTimeoutError:
 
-            popular = max(
-                popular_candidates,
-                key=lambda x: x["usage"]
-            )
+                        report.append(
+                            "⚠️ Şablon səhifəsinin yüklənməsi vaxtı bitdi."
+                        )
 
-            report.append(
-                "\n🔥 ƏN POPULYAR ŞABLON"
-            )
+                    except Exception as error:
 
-            report.append(
-                f"📌 {popular['title']}"
-            )
-
-            report.append(
-                f"İstifadə: {format_number(popular['usage'])}"
-            )
-
-            if popular["date"]:
+                        report.append(
+                            "⚠️ Şablon yoxlanmadı: "
+                            + str(error)[:100]
+                        )
 
                 report.append(
-                    "📅 Tarix: "
-                    + popular["date"].strftime("%d.%m.%Y")
+                    "Təsdiqlənmiş uyğun şablon: "
+                    + str(len(confirmed_templates))
                 )
 
-            report.append(popular["url"])
+                if not confirmed_templates:
 
-        else:
+                    report.append(
+                        "❌ Səslə uyğunluğu metadata əsasında "
+                        "təsdiqlənən şablon tapılmadı."
+                    )
 
-            report.append(
-                "\n🔥 Ən populyar: istifadə sayı tapılmadı."
-            )
+                    continue
 
-        # ƏN YENİ
-        dated_candidates = [
-            item for item in confirmed_templates
-            if item["date"] is not None
-        ]
+                # ƏN POPULYAR
+                popular_candidates = [
+                    item for item in confirmed_templates
+                    if item["usage"] is not None
+                ]
 
-        if dated_candidates:
+                if popular_candidates:
 
-            newest = max(
-                dated_candidates,
-                key=lambda x: x["date"]
-            )
+                    popular = max(
+                        popular_candidates,
+                        key=lambda item: item["usage"]
+                    )
 
-            report.append(
-                "\n🆕 ƏN YENİ ŞABLON"
-            )
+                    report.append("\n🔥 ƏN POPULYAR ŞABLON")
+                    report.append(f"📌 {popular['title']}")
+                    report.append(
+                        f"İstifadə: {format_number(popular['usage'])}"
+                    )
 
-            report.append(
-                f"📌 {newest['title']}"
-            )
+                    if popular["date"]:
+                        report.append(
+                            "📅 Tarix: "
+                            + popular["date"].strftime("%d.%m.%Y")
+                        )
 
-            report.append(
-                "📅 Tarix: "
-                + newest["date"].strftime("%d.%m.%Y")
-            )
+                    report.append(popular["url"])
 
-            report.append(
-                f"İstifadə: {format_number(newest['usage'])}"
-            )
+                else:
 
-            report.append(newest["url"])
+                    report.append(
+                        "\n🔥 Ən populyar: istifadə sayı tapılmadı."
+                    )
 
-        else:
+                # ƏN YENİ
+                dated_candidates = [
+                    item for item in confirmed_templates
+                    if item["date"] is not None
+                ]
 
-            report.append(
-                "\n🆕 Ən yeni: yayımlanma tarixi tapılmadı."
-            )
+                if dated_candidates:
 
-        # Tarixçədə gündəlik istifadə göstəricisi
-        for item in confirmed_templates:
+                    newest = max(
+                        dated_candidates,
+                        key=lambda item: item["date"]
+                    )
 
-            template_id = item["id"]
+                    report.append("\n🆕 ƏN YENİ ŞABLON")
+                    report.append(f"📌 {newest['title']}")
+                    report.append(
+                        "📅 Tarix: "
+                        + newest["date"].strftime("%d.%m.%Y")
+                    )
+                    report.append(
+                        f"İstifadə: {format_number(newest['usage'])}"
+                    )
+                    report.append(newest["url"])
 
-            record = history["templates"].get(
-                template_id,
-                {}
-            )
+                else:
 
-            record["title"] = item["title"]
-            record["url"] = item["url"]
+                    report.append(
+                        "\n🆕 Ən yeni: yayımlanma tarixi tapılmadı."
+                    )
 
-            if item["date"]:
-                record["upload_date"] = item["date"].isoformat()
+                # TARİXÇƏ
+                for item in confirmed_templates:
 
-            if item["usage"] is not None:
+                    template_id = item["id"]
 
-                today = datetime.now(AZ_TZ).strftime(
-                    "%Y-%m-%d"
-                )
+                    record = history["templates"].get(
+                        template_id,
+                        {}
+                    )
 
-                daily = record.setdefault(
-                    "daily_usage",
-                    []
-                )
+                    record["title"] = item["title"]
+                    record["url"] = item["url"]
 
-                if (
-                    not daily
-                    or daily[-1].get("date") != today
-                ):
+                    if item["date"]:
+                        record["upload_date"] = item["date"].isoformat()
 
-                    daily.append({
-                        "date": today,
-                        "usage": item["usage"]
-                    })
+                    if item["usage"] is not None:
 
-                record["daily_usage"] = daily[-30:]
-                record["last_usage"] = item["usage"]
+                        today = datetime.now(AZ_TZ).strftime("%Y-%m-%d")
 
-            history["templates"][template_id] = record
+                        daily = record.setdefault("daily_usage", [])
 
-        results.append({
-            "sound": sound_name,
-            "templates": confirmed_templates
-        })
+                        if (
+                            not daily
+                            or daily[-1].get("date") != today
+                        ):
 
-    return results
+                            daily.append({
+                                "date": today,
+                                "usage": item["usage"]
+                            })
+
+                        record["daily_usage"] = daily[-30:]
+                        record["last_usage"] = item["usage"]
+
+                    history["templates"][template_id] = record
+
+        finally:
+            browser.close()
 
 
 # =====================================================
-# TELEGRAM MESAJININ HAZIRLANMASI
+# TELEGRAM
 # =====================================================
 
 def send_telegram(report):
 
-    token = os.environ.get(
-        "TELEGRAM_BOT_TOKEN"
-    )
-
-    chat_id = os.environ.get(
-        "TELEGRAM_CHAT_ID"
-    )
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
     if not token or not chat_id:
-
-        raise RuntimeError(
-            "Telegram secret-ləri tapılmadı."
-        )
+        raise RuntimeError("Telegram secret-ləri tapılmadı.")
 
     message = "\n".join(report)
 
-    # Mesajları sətir sərhədlərində bölürük.
     chunks = []
     current = ""
 
@@ -872,87 +829,8 @@ def send_telegram(report):
             }
         )
 
-        with urllib.request.urlopen(
-            request,
-            timeout=30
-        ) as response:
-
-            print(
-                response.read().decode("utf-8")
-            )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            print(response.read().decode("utf-8"))
 
 
-# =====================================================
-# ƏSAS PROQRAM
-# =====================================================
-
-def main():
-
-    report = [
-        "🔎 TÜRKİYƏ TREND HESABATI",
-        "📅 Tarix: "
-        + datetime.now(AZ_TZ).strftime("%d.%m.%Y %H:%M")
-    ]
-
-    history = load_history()
-
-    # ENDLESS
-    try:
-
-        music, hashtags = get_endless_data(report)
-
-        report.append(
-            f"\n🎵 TikTok musiqiləri: {len(music)}"
-        )
-
-        for item in music[:MAX_SOUNDS]:
-
-            report.append(
-                f"• {item['name'][:100]}\n"
-                f"{item['url']}"
-            )
-
-        report.append(
-            f"\n🏷 TikTok hashtagları: {len(hashtags)}"
-        )
-
-        for item in hashtags[:10]:
-
-            report.append(
-                f"• {item['name'][:80]}\n"
-                f"{item['url']}"
-            )
-
-    except Exception as error:
-
-        report.append(
-            "\n❌ ENDLESS xətası: "
-            + str(error)[:200]
-        )
-
-        music = []
-
-    # CAPCUT
-    if music:
-
-        search_capcut_for_sounds(
-            music,
-            report,
-            history
-        )
-
-    else:
-
-        report.append(
-            "\n⚠️ CapCut axtarışı üçün trend musiqi tapılmadı."
-        )
-
-    # TARİXÇƏNİ SAXLA
-    save_history(history)
-
-    # TELEGRAM
-    send_telegram(report)
-
-
-if __name__ == "__main__":
-    main()
+# =================================
