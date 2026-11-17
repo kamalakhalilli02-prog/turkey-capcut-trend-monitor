@@ -1,3 +1,4 @@
+
 name: Daily Turkey Trend Monitor
 
 on:
@@ -21,9 +22,14 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install Playwright
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
       - name: Run trend monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python trend_monitor.py
-        
