@@ -5,6 +5,7 @@ import re
 import time
 import unicodedata
 import urllib.request
+import urllib.error
 
 from datetime import datetime, timezone, timedelta
 from html.parser import HTMLParser
@@ -14,7 +15,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 
 # =====================================================
-# AYARLAR
+# SETTINGS
 # =====================================================
 
 ENDLESS_URL = "https://endless.app/radar/tiktok/turkey"
@@ -71,7 +72,7 @@ class Parser(HTMLParser):
 
 
 # =====================================================
-# WEB SƏHİFƏSİ OXUMA
+# WEB REQUEST
 # =====================================================
 
 def get_page(url):
@@ -89,7 +90,7 @@ def get_page(url):
 
 
 # =====================================================
-# TARİXÇƏ
+# HISTORY
 # =====================================================
 
 def load_history():
@@ -101,18 +102,22 @@ def load_history():
         }
 
     try:
+
         with open(HISTORY_FILE, "r", encoding="utf-8") as file:
             data = json.load(file)
 
         if not isinstance(data, dict):
-            raise ValueError("History formatı düzgün deyil")
+            raise ValueError("Invalid history format")
 
         data.setdefault("templates", {})
         data.setdefault("sound_matches", {})
 
         return data
 
-    except Exception:
+    except Exception as error:
+
+        print(f"History oxunmadı: {error}", flush=True)
+
         return {
             "templates": {},
             "sound_matches": {}
@@ -129,9 +134,11 @@ def save_history(history):
             indent=2
         )
 
+    print("Tarixçə saxlanıldı.", flush=True)
+
 
 # =====================================================
-# MƏLUMATLARIN TƏMİZLƏNMƏSİ
+# TEXT NORMALIZATION
 # =====================================================
 
 def normalize_text(value):
@@ -154,7 +161,6 @@ def clean_sound_name(name):
 
     name = str(name or "").strip()
 
-    # Original sound adları mahnı adı deyil.
     if re.match(
         r"^\s*original\s+(sound|audio)\s*[-–—:]",
         name,
@@ -174,10 +180,12 @@ def clean_sound_name(name):
 
 
 # =====================================================
-# ENDLESS - TREND MUSİQİLƏRİ VƏ HASHTAGLAR
+# ENDLESS
 # =====================================================
 
 def get_endless_data(report):
+
+    print("Endless səhifəsi yüklənir...", flush=True)
 
     html = get_page(ENDLESS_URL)
 
@@ -200,6 +208,7 @@ def get_endless_data(report):
         if "tiktok.com/music/" in link:
 
             if link not in seen_music:
+
                 seen_music.add(link)
 
                 music.append({
@@ -211,6 +220,7 @@ def get_endless_data(report):
         elif "tiktok.com/tag/" in link:
 
             if link not in seen_tags:
+
                 seen_tags.add(link)
 
                 hashtags.append({
@@ -218,11 +228,17 @@ def get_endless_data(report):
                     "url": urljoin(ENDLESS_URL, link)
                 })
 
+    print(
+        f"Endless tamamlandı: {len(music)} musiqi, "
+        f"{len(hashtags)} hashtag",
+        flush=True
+    )
+
     return music, hashtags
 
 
 # =====================================================
-# ŞABLON TARİXİ
+# DATE EXTRACTION
 # =====================================================
 
 def extract_upload_date(html):
@@ -276,7 +292,7 @@ def extract_upload_date(html):
 
 
 # =====================================================
-# İSTİFADƏ SAYI
+# USAGE EXTRACTION
 # =====================================================
 
 def number_to_int(value):
@@ -419,7 +435,7 @@ def audio_matches(sound_name, audio_labels):
 
 
 # =====================================================
-# PLAYWRIGHT - CAPCUT AXTARIŞI
+# PLAYWRIGHT SEARCH
 # =====================================================
 
 def find_search_box(page):
@@ -438,6 +454,7 @@ def find_search_box(page):
         locator = page.locator(selector)
 
         try:
+
             count = min(locator.count(), 10)
 
             for index in range(count):
@@ -455,6 +472,8 @@ def find_search_box(page):
 
 def find_template_links(page, sound_name):
 
+    print(f"CapCut axtarışı: {sound_name}", flush=True)
+
     page.goto(
         CAPCUT_URL,
         wait_until="domcontentloaded",
@@ -467,8 +486,7 @@ def find_template_links(page, sound_name):
 
     if search_box is None:
         raise RuntimeError(
-            "CapCut səhifəsində axtarış sahəsi tapılmadı. "
-            "Səhifənin quruluşu dəyişmiş ola bilər."
+            "CapCut axtarış sahəsi tapılmadı."
         )
 
     search_box.fill(sound_name)
@@ -476,7 +494,6 @@ def find_template_links(page, sound_name):
 
     page.wait_for_timeout(6000)
 
-    # Axtarışdan sonra səhifənin linklərini götürürük.
     links = page.locator("a").evaluate_all(
         """elements => elements.map(a => ({
             href: a.href,
@@ -519,7 +536,7 @@ def find_template_links(page, sound_name):
 
 
 # =====================================================
-# ŞABLON DETALLARININ YOXLanMASI
+# TEMPLATE INSPECTION
 # =====================================================
 
 def inspect_template(page, candidate, sound_name):
@@ -566,7 +583,7 @@ def inspect_template(page, candidate, sound_name):
 
 
 # =====================================================
-# HƏR TREND SƏS ÜÇÜN CAPCUT AXTARIŞI
+# CAPCUT PROCESS
 # =====================================================
 
 def search_capcut_for_sounds(music, report, history):
@@ -604,7 +621,7 @@ def search_capcut_for_sounds(music, report, history):
 
                     report.append(
                         "⚠️ Original sound və ya konkret adı olmayan səsdir. "
-                        "Mahnı adı kimi axtarılmadı."
+                        "Axtarış buraxıldı."
                     )
 
                     continue
@@ -625,7 +642,7 @@ def search_capcut_for_sounds(music, report, history):
                 except Exception as error:
 
                     report.append(
-                        "❌ CapCut brauzer axtarış xətası: "
+                        "❌ CapCut axtarış xətası: "
                         + str(error)[:180]
                     )
 
@@ -650,12 +667,6 @@ def search_capcut_for_sounds(music, report, history):
 
                         time.sleep(0.5)
 
-                    except PlaywrightTimeoutError:
-
-                        report.append(
-                            "⚠️ Şablon səhifəsinin yüklənməsi vaxtı bitdi."
-                        )
-
                     except Exception as error:
 
                         report.append(
@@ -677,7 +688,6 @@ def search_capcut_for_sounds(music, report, history):
 
                     continue
 
-                # ƏN POPULYAR
                 popular_candidates = [
                     item for item in confirmed_templates
                     if item["usage"] is not None
@@ -710,7 +720,6 @@ def search_capcut_for_sounds(music, report, history):
                         "\n🔥 Ən populyar: istifadə sayı tapılmadı."
                     )
 
-                # ƏN YENİ
                 dated_candidates = [
                     item for item in confirmed_templates
                     if item["date"] is not None
@@ -740,7 +749,6 @@ def search_capcut_for_sounds(music, report, history):
                         "\n🆕 Ən yeni: yayımlanma tarixi tapılmadı."
                     )
 
-                # TARİXÇƏ
                 for item in confirmed_templates:
 
                     template_id = item["id"]
@@ -782,16 +790,21 @@ def search_capcut_for_sounds(music, report, history):
 
 
 # =====================================================
-# TELEGRAM
+# TELEGRAM WITH DIAGNOSTICS
 # =====================================================
 
 def send_telegram(report):
 
+    print("Telegram göndərişi başlayır...", flush=True)
+
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
-    if not token or not chat_id:
-        raise RuntimeError("Telegram secret-ləri tapılmadı.")
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN secret tapılmadı.")
+
+    if not chat_id:
+        raise RuntimeError("TELEGRAM_CHAT_ID secret tapılmadı.")
 
     message = "\n".join(report)
 
@@ -814,7 +827,12 @@ def send_telegram(report):
     if current:
         chunks.append(current)
 
-    for chunk in chunks:
+    print(
+        f"Telegram-a göndəriləcək mesaj sayı: {len(chunks)}",
+        flush=True
+    )
+
+    for index, chunk in enumerate(chunks, 1):
 
         data = json.dumps({
             "chat_id": chat_id,
@@ -829,8 +847,7 @@ def send_telegram(report):
             }
         )
 
-        with urllib.request.urlopen(request, timeout=30) as response:
-            print(response.read().decode("utf-8"))
+        try:
 
-
-# =================================
+            with urllib.request.urlopen(
+      
