@@ -2,42 +2,50 @@
 import os
 import json
 import re
+import time
+import unicodedata
 import urllib.request
+
 from datetime import datetime, timezone, timedelta
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, quote
 
-SITES = {
-    "ENDLESS": "https://endless.app/radar/tiktok/turkey",
-    "CAPCUT_PAGES": [
-        "https://www.capcut.com/tr-tr/explore/turkish-templates",
-        "https://www.capcut.com/explore/latest-trending-templates",
-        "https://www.capcut.com/explore/new-trending-on-CapCut",
-        "https://www.capcut.com/explore/Latest",
-        "https://www.capcut.com/template"
-    ]
-}
+
+# =====================================================
+# AYARLAR
+# =====================================================
+
+ENDLESS_URL = "https://endless.app/radar/tiktok/turkey"
 
 HISTORY_FILE = "capcut_history.json"
 
-DAYS_BACK = 30
-MAX_DETAILS_TO_CHECK = 35
-MAX_NEW_TO_REPORT = 15
-MAX_GROWTH_TO_REPORT = 10
+MAX_SOUNDS = 10
+MAX_DETAILS_PER_SOUND = 10
 
 AZ_TZ = timezone(timedelta(hours=4))
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+# =====================================================
+# HTML PARSER
+# =====================================================
 
 class Parser(HTMLParser):
+
     def __init__(self):
         super().__init__()
+
         self.links = []
         self.current_link = None
         self.text = []
-        self.h1 = []
-        self.in_h1 = False
 
     def handle_starttag(self, tag, attrs):
+
         attrs = dict(attrs)
 
         if tag == "a":
@@ -46,88 +54,91 @@ class Parser(HTMLParser):
                 "text": ""
             }
 
-        if tag == "h1":
-            self.in_h1 = True
-
     def handle_data(self, data):
+
         self.text.append(data)
 
         if self.current_link is not None:
             self.current_link["text"] += data
 
-        if self.in_h1:
-            self.h1.append(data)
-
     def handle_endtag(self, tag):
+
         if tag == "a" and self.current_link is not None:
             self.links.append(self.current_link)
             self.current_link = None
 
-        if tag == "h1":
-            self.in_h1 = False
 
+# =====================================================
+# WEB SƏHİFƏSİ OXUMA
+# =====================================================
 
 def get_page(url):
-    req = urllib.request.Request(
+
+    request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": USER_AGENT,
             "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8"
         }
     )
 
-    with urllib.request.urlopen(req, timeout=35) as response:
+    with urllib.request.urlopen(
+        request,
+        timeout=35
+    ) as response:
+
         return response.read().decode(
             "utf-8",
             errors="replace"
         )
 
 
-def get_template_id(url):
-    path = urlparse(url).path.rstrip("/")
-    return path.split("/")[-1]
-
+# =====================================================
+# TARİXÇƏ
+# =====================================================
 
 def load_history():
+
     if not os.path.exists(HISTORY_FILE):
         return {
-            "reported": [],
-            "templates": {}
+            "templates": {},
+            "sound_matches": {}
         }
 
     try:
+
         with open(
             HISTORY_FILE,
             "r",
             encoding="utf-8"
         ) as file:
+
             data = json.load(file)
 
         if not isinstance(data, dict):
             raise ValueError("History formatı düzgün deyil")
 
-        data.setdefault("reported", [])
         data.setdefault("templates", {})
+        data.setdefault("sound_matches", {})
 
         return data
 
     except Exception:
+
         return {
-            "reported": [],
-            "templates": {}
+            "templates": {},
+            "sound_matches": {}
         }
 
 
 def save_history(history):
+
     with open(
         HISTORY_FILE,
         "w",
         encoding="utf-8"
     ) as file:
+
         json.dump(
             history,
             file,
@@ -136,20 +147,200 @@ def save_history(history):
         )
 
 
+# =====================================================
+# MƏLUMATLARIN TƏMİZLƏNMƏSİ
+# =====================================================
+
+def normalize_text(value):
+
+    value = str(value or "").casefold()
+
+    value = unicodedata.normalize(
+        "NFKD",
+        value
+    )
+
+    value = "".join(
+        char for char in value
+        if not unicodedata.combining(char)
+    )
+
+    value = re.sub(
+        r"[^a-z0-9\s]",
+        " ",
+        value
+    )
+
+    return " ".join(value.split())
+
+
+def clean_sound_name(name):
+
+    name = str(name or "").strip()
+
+    name = re.sub(
+        r"^\s*original\s+sound\s*[-–—:]\s*",
+        "",
+        name,
+        flags=re.I
+    )
+
+    name = re.sub(
+        r"^\s*original\s+audio\s*[-–—:]\s*",
+        "",
+        name,
+        flags=re.I
+    )
+
+    name = name.strip(" .-_")
+
+    generic = [
+        "original sound",
+        "original audio",
+        "orijinal ses",
+        "orijinal ses kaydi"
+    ]
+
+    if normalize_text(name) in generic:
+        return ""
+
+    return name
+
+
+# =====================================================
+# ENDLESS - TREND MUSİQİLƏRİ VƏ HASHTAGLAR
+# =====================================================
+
+def get_endless_data(report):
+
+    html = get_page(ENDLESS_URL)
+
+    parser = Parser()
+    parser.feed(html)
+
+    report.append(
+        f"\n📌 ENDLESS: {len(html)} simvol"
+    )
+
+    music = []
+    hashtags = []
+
+    seen_music = set()
+    seen_tags = set()
+
+    for item in parser.links:
+
+        link = item.get("url", "")
+        name = item.get("text", "").strip()
+
+        if "tiktok.com/music/" in link:
+
+            if link not in seen_music:
+
+                seen_music.add(link)
+
+                music.append({
+                    "name": name or "Ad göstərilmir",
+                    "search_name": clean_sound_name(name),
+                    "url": urljoin(ENDLESS_URL, link)
+                })
+
+        elif "tiktok.com/tag/" in link:
+
+            if link not in seen_tags:
+
+                seen_tags.add(link)
+
+                hashtags.append({
+                    "name": name or "Hashtag",
+                    "url": urljoin(ENDLESS_URL, link)
+                })
+
+    return music, hashtags
+
+
+# =====================================================
+# CAPCUT AXTARIŞ URL
+# =====================================================
+
+def make_capcut_search_url(sound_name):
+
+    # Axtarış ifadəsini URL üçün uyğun formaya salırıq.
+    slug = "-".join(
+        normalize_text(sound_name).split()
+    )
+
+    return (
+        "https://www.capcut.com/explore/"
+        + quote(slug, safe="-")
+    )
+
+
+# =====================================================
+# CAPCUT ŞABLON LINKLƏRİNİN TAPILMASI
+# =====================================================
+
+def find_template_links(search_url):
+
+    html = get_page(search_url)
+
+    parser = Parser()
+    parser.feed(html)
+
+    found = []
+    seen = set()
+
+    for item in parser.links:
+
+        link = urljoin(
+            search_url,
+            item.get("url", "")
+        )
+
+        parsed = urlparse(link)
+
+        if "capcut.com" not in parsed.netloc:
+            continue
+
+        if "/template-detail/" not in parsed.path:
+            continue
+
+        template_id = parsed.path.rstrip("/").split("/")[-1]
+
+        if not template_id or template_id in seen:
+            continue
+
+        seen.add(template_id)
+
+        found.append({
+            "id": template_id,
+            "url": link,
+            "anchor": item.get("text", "").strip()
+        })
+
+    return found
+
+
+# =====================================================
+# ŞABLON TARİXİ
+# =====================================================
+
 def extract_upload_date(html):
-    """
-    Əsas tarix sahəsi uploadDate-dir.
-    Ümumi createTime sahəsi dərc tarixi kimi istifadə edilmir.
-    """
 
     patterns = [
         r'["\']uploadDate["\']\s*:\s*["\']?(\d{10,13})',
         r'["\']datePublished["\']\s*:\s*["\']?(\d{10,13})',
-        r'["\']uploadDate["\']\s*:\s*["\'](20\d{2}-\d{2}-\d{2})'
+        r'["\']uploadDate["\']\s*:\s*["\'](20\d{2}-\d{2}-\d{2})',
+        r'["\']datePublished["\']\s*:\s*["\'](20\d{2}-\d{2}-\d{2})'
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, html, re.I)
+
+        match = re.search(
+            pattern,
+            html,
+            re.I
+        )
 
         if not match:
             continue
@@ -157,33 +348,54 @@ def extract_upload_date(html):
         value = match.group(1)
 
         try:
+
             if value.isdigit():
+
                 timestamp = int(value)
 
                 if len(value) == 13:
-                    timestamp = timestamp / 1000
+                    timestamp /= 1000
 
-                return datetime.fromtimestamp(
+                date = datetime.fromtimestamp(
                     timestamp,
                     timezone.utc
                 ).astimezone(AZ_TZ)
 
-            return datetime.strptime(
-                value,
-                "%Y-%m-%d"
-            ).replace(tzinfo=AZ_TZ)
+            else:
 
-        except (ValueError, OverflowError, OSError):
+                date = datetime.strptime(
+                    value,
+                    "%Y-%m-%d"
+                ).replace(tzinfo=AZ_TZ)
+
+            now = datetime.now(AZ_TZ)
+
+            # Gələcək tarixləri qəbul etmirik.
+            if date > now:
+                continue
+
+            return date
+
+        except (
+            ValueError,
+            OverflowError,
+            OSError
+        ):
             continue
 
     return None
 
 
+# =====================================================
+# İSTİFADƏ SAYI
+# =====================================================
+
 def number_to_int(value):
-    if not value or value == "Tapılmadı":
+
+    if not value:
         return None
 
-    value = value.upper()
+    value = str(value).upper()
     value = value.replace(" ", "")
     value = value.replace(",", ".")
 
@@ -203,11 +415,13 @@ def number_to_int(value):
 
     try:
         return int(float(value) * multiplier)
+
     except ValueError:
         return None
 
 
 def format_number(number):
+
     if number is None:
         return "Tapılmadı"
 
@@ -221,6 +435,7 @@ def format_number(number):
 
 
 def extract_usage(text):
+
     patterns = [
         r'([\d.,]+\s*[KMB]?)\s*(?:uses|use)',
         r'([\d.,]+\s*[KMB]?)\s*(?:kullanım|kullan)',
@@ -228,9 +443,15 @@ def extract_usage(text):
     ]
 
     for pattern in patterns:
-        matches = re.findall(pattern, text, re.I)
+
+        matches = re.findall(
+            pattern,
+            text,
+            re.I
+        )
 
         for value in matches:
+
             number = number_to_int(value)
 
             if number is not None:
@@ -239,359 +460,405 @@ def extract_usage(text):
     return None
 
 
-def inspect_template(url):
-    html = get_page(url)
+# =====================================================
+# ŞABLONDA MUSİQİ METADATA-SININ TAPILMASI
+# =====================================================
+
+def extract_audio_labels(html):
+
+    labels = []
+
+    # Yalnız musiqi/audio ilə əlaqəli açıq metadata
+    # sahələrini axtarırıq.
+    fields = [
+        "musicName",
+        "music_name",
+        "songName",
+        "song_name",
+        "soundName",
+        "sound_name",
+        "audioName",
+        "audio_name",
+        "musicTitle",
+        "audioTitle",
+        "trackName",
+        "track_name"
+    ]
+
+    for field in fields:
+
+        pattern = (
+            r'["\']'
+            + re.escape(field)
+            + r'["\']\s*:\s*["\']([^"\']{2,150})'
+        )
+
+        matches = re.findall(
+            pattern,
+            html,
+            re.I
+        )
+
+        for value in matches:
+
+            value = value.strip()
+
+            if value and value not in labels:
+                labels.append(value)
+
+    return labels
+
+
+def audio_matches(sound_name, audio_labels):
+
+    target = normalize_text(sound_name)
+
+    if not target:
+        return False
+
+    target_words = set(target.split())
+
+    for label in audio_labels:
+
+        candidate = normalize_text(label)
+
+        if not candidate:
+            continue
+
+        # Tam ifadə uyğunluğu
+        if target == candidate:
+            return True
+
+        if target in candidate or candidate in target:
+            return True
+
+        candidate_words = set(candidate.split())
+
+        # Çoxsözlü adlarda bütün əsas sözlər uyğun gəlməlidir.
+        if len(target_words) >= 2:
+
+            if target_words.issubset(candidate_words):
+                return True
+
+    return False
+
+
+# =====================================================
+# ŞABLON DETALLARININ YOXLANMASI
+# =====================================================
+
+def inspect_template(candidate, sound_name):
+
+    html = get_page(candidate["url"])
 
     parser = Parser()
     parser.feed(html)
 
     page_text = " ".join(parser.text)
-    title = " ".join(parser.h1).strip()
+
+    title = page_text.split("\n")[0].strip()
 
     if not title:
-        title = "Başlıq tapılmadı"
+        title = candidate.get("anchor") or "Başlıq tapılmadı"
 
-    upload_date = extract_upload_date(html)
-    usage = extract_usage(page_text)
+    audio_labels = extract_audio_labels(html)
+
+    confirmed = audio_matches(
+        sound_name,
+        audio_labels
+    )
 
     return {
-        "id": get_template_id(url),
-        "url": url,
-        "title": title,
-        "date": upload_date,
-        "usage": usage
+        "id": candidate["id"],
+        "url": candidate["url"],
+        "title": title[:120],
+        "date": extract_upload_date(html),
+        "usage": extract_usage(page_text),
+        "audio_labels": audio_labels,
+        "confirmed": confirmed
     }
 
 
-def discover_templates(report):
-    found = []
-    seen = set()
+# =====================================================
+# HƏR TREND SƏS ÜÇÜN CAPCUT AXTARIŞI
+# =====================================================
 
-    for page_url in SITES["CAPCUT_PAGES"]:
-        try:
-            html = get_page(page_url)
+def search_capcut_for_sounds(music, report, history):
 
-            parser = Parser()
-            parser.feed(html)
+    results = []
 
-            page_count = 0
+    report.append(
+        "\n\n🎬 CAPCUT - TREND SƏSLƏRƏ UYĞUN ŞABLONLAR"
+    )
 
-            for item in parser.links:
-                link = urljoin(page_url, item["url"])
-                parsed = urlparse(link)
+    for index, sound in enumerate(
+        music[:MAX_SOUNDS],
+        1
+    ):
 
-                if (
-                    "capcut.com" not in parsed.netloc
-                    or "/template-detail/" not in parsed.path
-                ):
-                    continue
+        sound_name = sound["name"]
+        search_name = sound["search_name"]
 
-                template_id = get_template_id(link)
+        report.append(
+            f"\n\n{'─' * 25}"
+        )
 
-                if not template_id or template_id in seen:
-                    continue
+        report.append(
+            f"🎵 {index}. {sound_name}"
+        )
 
-                seen.add(template_id)
+        report.append(
+            f"🔗 TikTok səsi: {sound['url']}"
+        )
 
-                found.append({
-                    "url": link,
-                    "source": page_url,
-                    "anchor": item["text"].strip()
-                })
-
-                page_count += 1
+        if not search_name:
 
             report.append(
-                f"• {page_url}: {page_count} yeni link"
+                "⚠️ Səsin axtarış üçün konkret adı yoxdur. "
+                "CapCut axtarışı buraxıldı."
+            )
+
+            continue
+
+        report.append(
+            f"🔎 CapCut axtarışı: {search_name}"
+        )
+
+        search_url = make_capcut_search_url(
+            search_name
+        )
+
+        try:
+
+            candidates = find_template_links(
+                search_url
+            )
+
+            report.append(
+                f"Tapılan şablon linkləri: {len(candidates)}"
             )
 
         except Exception as error:
+
             report.append(
-                f"❌ Səhifə xətası: {page_url}\n"
+                f"❌ CapCut axtarış xətası: "
                 f"{str(error)[:150]}"
             )
 
-    return found
+            continue
 
+        candidates = candidates[:MAX_DETAILS_PER_SOUND]
 
-def main():
-    report = [
-        "🔎 TÜRKİYƏ TREND HESABATI",
-        f"📅 Tarix: {datetime.now(AZ_TZ).strftime('%d.%m.%Y %H:%M')}"
-    ]
+        confirmed_templates = []
 
-    # -----------------------------
-    # ENDLESS - MUSİQİ VƏ HASHTAG
-    # -----------------------------
+        for candidate in candidates:
 
-    try:
-        html = get_page(SITES["ENDLESS"])
+            try:
 
-        parser = Parser()
-        parser.feed(html)
-
-        report.append(
-            f"\n📌 ENDLESS: {len(html)} simvol"
-        )
-
-        groups = {
-            "🎵 TikTok musiqiləri": "tiktok.com/music/",
-            "🏷 TikTok hashtagları": "tiktok.com/tag/"
-        }
-
-        for title, marker in groups.items():
-            found = []
-            seen = set()
-
-            for item in parser.links:
-                link = item["url"]
-
-                if marker in link and link not in seen:
-                    seen.add(link)
-                    found.append(item)
-
-            report.append(
-                f"\n{title}: {len(found)} link"
-            )
-
-            for item in found[:10]:
-                name = (
-                    item["text"].strip()
-                    or "Ad göstərilmir"
+                item = inspect_template(
+                    candidate,
+                    search_name
                 )
+
+                if item["confirmed"]:
+
+                    confirmed_templates.append(item)
+
+                time.sleep(0.4)
+
+            except Exception as error:
 
                 report.append(
-                    f"• {name[:80]}\n"
-                    f"{urljoin(SITES['ENDLESS'], item['url'])}"
+                    f"⚠️ Şablon yoxlanmadı: "
+                    f"{str(error)[:100]}"
                 )
 
-    except Exception as error:
         report.append(
-            f"\n❌ ENDLESS xətası: {str(error)[:200]}"
+            f"Təsdiqlənmiş uyğun şablon: "
+            f"{len(confirmed_templates)}"
         )
 
-    # -----------------------------
-    # CAPCUT - ÇOX MƏNBƏDƏN AXTARIŞ
-    # -----------------------------
+        if not confirmed_templates:
 
-    report.append("\n\n📌 CAPCUT ŞABLON AXTARIŞI")
-    report.append("Yoxlanılan mənbələr:")
+            report.append(
+                "❌ Səslə uyğunluğu metadata əsasında "
+                "təsdiqlənən şablon tapılmadı."
+            )
 
-    candidates = discover_templates(report)
+            continue
 
-    report.append(
-        f"\nToplam unikal şablon linki: {len(candidates)}"
-    )
+        # ƏN POPULYAR
+        popular_candidates = [
+            item for item in confirmed_templates
+            if item["usage"] is not None
+        ]
 
-    candidates = candidates[:MAX_DETAILS_TO_CHECK]
+        if popular_candidates:
 
-    report.append(
-        f"Detallı yoxlanılacaq şablon: {len(candidates)}"
-    )
+            popular = max(
+                popular_candidates,
+                key=lambda x: x["usage"]
+            )
 
-    now = datetime.now(AZ_TZ)
-    cutoff = now - timedelta(days=DAYS_BACK)
+            report.append(
+                "\n🔥 ƏN POPULYAR ŞABLON"
+            )
 
-    history = load_history()
-    reported_ids = set(history.get("reported", []))
-    template_history = history.get("templates", {})
+            report.append(
+                f"📌 {popular['title']}"
+            )
 
-    recent_templates = []
-    unknown_dates = 0
-    old_templates = 0
-    checked = 0
+            report.append(
+                f"İstifadə: {format_number(popular['usage'])}"
+            )
 
-    for candidate in candidates:
-        try:
-            item = inspect_template(candidate["url"])
-            checked += 1
+            if popular["date"]:
 
-            if item["date"] is None:
-                unknown_dates += 1
-                continue
+                report.append(
+                    "📅 Tarix: "
+                    + popular["date"].strftime("%d.%m.%Y")
+                )
 
-            if not (cutoff <= item["date"] <= now):
-                old_templates += 1
-                continue
+            report.append(popular["url"])
+
+        else:
+
+            report.append(
+                "\n🔥 Ən populyar: istifadə sayı tapılmadı."
+            )
+
+        # ƏN YENİ
+        dated_candidates = [
+            item for item in confirmed_templates
+            if item["date"] is not None
+        ]
+
+        if dated_candidates:
+
+            newest = max(
+                dated_candidates,
+                key=lambda x: x["date"]
+            )
+
+            report.append(
+                "\n🆕 ƏN YENİ ŞABLON"
+            )
+
+            report.append(
+                f"📌 {newest['title']}"
+            )
+
+            report.append(
+                "📅 Tarix: "
+                + newest["date"].strftime("%d.%m.%Y")
+            )
+
+            report.append(
+                f"İstifadə: {format_number(newest['usage'])}"
+            )
+
+            report.append(newest["url"])
+
+        else:
+
+            report.append(
+                "\n🆕 Ən yeni: yayımlanma tarixi tapılmadı."
+            )
+
+        # Tarixçədə gündəlik istifadə göstəricisi
+        for item in confirmed_templates:
 
             template_id = item["id"]
-            previous = template_history.get(
+
+            record = history["templates"].get(
                 template_id,
                 {}
             )
 
-            previous_usage = previous.get("last_usage")
-            current_usage = item["usage"]
-
-            growth = None
-
-            if (
-                previous_usage is not None
-                and current_usage is not None
-            ):
-                growth = current_usage - previous_usage
-
-            item["growth"] = growth
-            item["previous_usage"] = previous_usage
-
-            recent_templates.append(item)
-
-            # Tarixçə məlumatlarını yenilə
-            if template_id not in template_history:
-                template_history[template_id] = {
-                    "title": item["title"],
-                    "url": item["url"],
-                    "upload_date": item["date"].isoformat(),
-                    "first_seen": now.isoformat(),
-                    "daily_usage": []
-                }
-
-            record = template_history[template_id]
-
             record["title"] = item["title"]
             record["url"] = item["url"]
-            record["upload_date"] = item["date"].isoformat()
 
-            if current_usage is not None:
-                record["last_usage"] = current_usage
+            if item["date"]:
+                record["upload_date"] = item["date"].isoformat()
 
-                daily_usage = record.setdefault(
+            if item["usage"] is not None:
+
+                today = datetime.now(AZ_TZ).strftime(
+                    "%Y-%m-%d"
+                )
+
+                daily = record.setdefault(
                     "daily_usage",
                     []
                 )
 
-                today = now.strftime("%Y-%m-%d")
+                if (
+                    not daily
+                    or daily[-1].get("date") != today
+                ):
 
-                if not daily_usage or daily_usage[-1].get("date") != today:
-                    daily_usage.append({
+                    daily.append({
                         "date": today,
-                        "usage": current_usage
+                        "usage": item["usage"]
                     })
 
-                record["daily_usage"] = daily_usage[-30:]
+                record["daily_usage"] = daily[-30:]
+                record["last_usage"] = item["usage"]
 
-        except Exception as error:
-            report.append(
-                f"\n⚠️ Şablon yoxlanmadı: "
-                f"{str(error)[:120]}"
-            )
+            history["templates"][template_id] = record
 
-    # İstifadə sayına görə sıralama
-    recent_templates.sort(
-        key=lambda x: (
-            x["usage"] is not None,
-            x["usage"] or 0
-        ),
-        reverse=True
+        results.append({
+            "sound": sound_name,
+            "templates": confirmed_templates
+        })
+
+    return results
+
+
+# =====================================================
+# TELEGRAM MESAJININ HAZIRLANMASI
+# =====================================================
+
+def send_telegram(report):
+
+    token = os.environ.get(
+        "TELEGRAM_BOT_TOKEN"
     )
 
-    report.append("\n📊 YOXLAMA NƏTİCƏSİ")
-    report.append(f"Yoxlanılan: {checked}")
-    report.append(f"Tarixi tapılmayan: {unknown_dates}")
-    report.append(f"30 gündən köhnə: {old_templates}")
-    report.append(
-        f"Son 30 gündə yayımlanan: {len(recent_templates)}"
+    chat_id = os.environ.get(
+        "TELEGRAM_CHAT_ID"
     )
-
-    # İlk dəfə tapılan şablonlar
-    new_templates = [
-        item for item in recent_templates
-        if item["id"] not in reported_ids
-    ]
-
-    report.append("\n🆕 YENİ TAPILAN ŞABLONLAR")
-
-    if new_templates:
-        for index, item in enumerate(
-            new_templates[:MAX_NEW_TO_REPORT],
-            1
-        ):
-            report.append(
-                f"\n{index}. {item['title']}"
-            )
-            report.append(
-                f"📅 Tarix: {item['date'].strftime('%d.%m.%Y')}"
-            )
-            report.append(
-                f"🔥 İstifadə: {format_number(item['usage'])}"
-            )
-            report.append(item["url"])
-
-            reported_ids.add(item["id"])
-
-    else:
-        report.append(
-            "Bu gün yeni və uyğun şablon tapılmadı."
-        )
-
-    # İstifadəsi artan şablonlar
-    growth_templates = [
-        item for item in recent_templates
-        if item["growth"] is not None and item["growth"] > 0
-    ]
-
-    growth_templates.sort(
-        key=lambda x: x["growth"],
-        reverse=True
-    )
-
-    report.append("\n📈 İSTİFADƏSİ ARTAN ŞABLONLAR")
-
-    if growth_templates:
-        for index, item in enumerate(
-            growth_templates[:MAX_GROWTH_TO_REPORT],
-            1
-        ):
-            report.append(
-                f"\n{index}. {item['title']}"
-            )
-            report.append(
-                f"İndiki istifadə: {format_number(item['usage'])}"
-            )
-            report.append(
-                f"Əvvəlki göstəricidən artım: "
-                f"+{format_number(item['growth'])}"
-            )
-            report.append(item["url"])
-
-    else:
-        report.append(
-            "Müqayisə üçün əvvəlki günlük göstərici yoxdur "
-            "və ya artım qeydə alınmayıb."
-        )
-
-    # Tarix tapılmayan şablonlarla bağlı xəbərdarlıq
-    if unknown_dates:
-        report.append(
-            "\n⚠️ Qeyd: Tarixi tapılmayan şablonlar "
-            "30 günlük siyahıya daxil edilməyib."
-        )
-
-    history["reported"] = list(reported_ids)
-    history["templates"] = template_history
-
-    save_history(history)
-
-    # -----------------------------
-    # TELEGRAM
-    # -----------------------------
-
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
     if not token or not chat_id:
+
         raise RuntimeError(
             "Telegram secret-ləri tapılmadı."
         )
 
     message = "\n".join(report)
 
-    chunks = [
-        message[i:i + 3500]
-        for i in range(0, len(message), 3500)
-    ]
+    # Mesajları sətir sərhədlərində bölürük.
+    chunks = []
+    current = ""
+
+    for line in message.splitlines():
+
+        if len(current) + len(line) + 1 > 3500:
+
+            if current:
+                chunks.append(current)
+
+            current = line
+
+        else:
+
+            current += ("\n" if current else "") + line
+
+    if current:
+        chunks.append(current)
 
     for chunk in chunks:
+
         data = json.dumps({
             "chat_id": chat_id,
             "text": chunk
@@ -609,11 +876,83 @@ def main():
             request,
             timeout=30
         ) as response:
+
             print(
                 response.read().decode("utf-8")
             )
 
 
+# =====================================================
+# ƏSAS PROQRAM
+# =====================================================
+
+def main():
+
+    report = [
+        "🔎 TÜRKİYƏ TREND HESABATI",
+        "📅 Tarix: "
+        + datetime.now(AZ_TZ).strftime("%d.%m.%Y %H:%M")
+    ]
+
+    history = load_history()
+
+    # ENDLESS
+    try:
+
+        music, hashtags = get_endless_data(report)
+
+        report.append(
+            f"\n🎵 TikTok musiqiləri: {len(music)}"
+        )
+
+        for item in music[:MAX_SOUNDS]:
+
+            report.append(
+                f"• {item['name'][:100]}\n"
+                f"{item['url']}"
+            )
+
+        report.append(
+            f"\n🏷 TikTok hashtagları: {len(hashtags)}"
+        )
+
+        for item in hashtags[:10]:
+
+            report.append(
+                f"• {item['name'][:80]}\n"
+                f"{item['url']}"
+            )
+
+    except Exception as error:
+
+        report.append(
+            "\n❌ ENDLESS xətası: "
+            + str(error)[:200]
+        )
+
+        music = []
+
+    # CAPCUT
+    if music:
+
+        search_capcut_for_sounds(
+            music,
+            report,
+            history
+        )
+
+    else:
+
+        report.append(
+            "\n⚠️ CapCut axtarışı üçün trend musiqi tapılmadı."
+        )
+
+    # TARİXÇƏNİ SAXLA
+    save_history(history)
+
+    # TELEGRAM
+    send_telegram(report)
+
+
 if __name__ == "__main__":
-    main()
-    
+    m
