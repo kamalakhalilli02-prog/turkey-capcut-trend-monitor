@@ -58,10 +58,16 @@ class Parser(HTMLParser):
 def get_page(url):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0"}
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8"
+        }
     )
 
-    with urllib.request.urlopen(req, timeout=25) as response:
+    with urllib.request.urlopen(req, timeout=30) as response:
         return response.read().decode(
             "utf-8", errors="replace"
         )
@@ -103,6 +109,63 @@ def parse_usage(value):
         return 0
 
 
+def find_created_date(page_text, html):
+    # Əvvəl brauzerdə görünən mətnə baxırıq.
+    # Tarixin yanında istifadə sayı varsa, onu üstün tuturuq.
+
+    date_patterns = [
+        r"(\d{4}-\d{2}-\d{2})"
+        r"(?=.{0,120}?\b(?:uses|kullanım)\b)",
+
+        r"(\d{2}[./-]\d{2}[./-]\d{4})"
+        r"(?=.{0,120}?\b(?:uses|kullanım)\b)"
+    ]
+
+    for source in [page_text, html]:
+        for pattern in date_patterns:
+            match = re.search(
+                pattern,
+                source,
+                re.I | re.S
+            )
+
+            if match:
+                value = match.group(1)
+
+                for fmt in [
+                    "%Y-%m-%d",
+                    "%d.%m.%Y",
+                    "%d/%m/%Y",
+                    "%d-%m-%Y"
+                ]:
+                    try:
+                        return datetime.strptime(
+                            value, fmt
+                        ).date()
+
+                    except ValueError:
+                        continue
+
+    # Ehtiyat variant: səhifədə tarix ayrıca göstərilirsə
+    for source in [page_text, html]:
+        match = re.search(
+            r"\b(20\d{2}-\d{2}-\d{2})\b",
+            source
+        )
+
+        if match:
+            try:
+                return datetime.strptime(
+                    match.group(1),
+                    "%Y-%m-%d"
+                ).date()
+
+            except ValueError:
+                pass
+
+    return None
+
+
 def get_template_details(url):
     html = get_page(url)
 
@@ -115,35 +178,23 @@ def get_template_details(url):
     if not title:
         title = "Şablon adı tapılmadı"
 
-    # Yayımlanma tarixini tap
-    date_match = re.search(
-        r"\b(20\d{2}-\d{2}-\d{2})\b",
-        page_text
+    # Həm görünən mətn, həm HTML yoxlanılır.
+    combined_text = page_text + "\n" + html
+
+    created_at = find_created_date(
+        page_text,
+        html
     )
 
-    created_at = None
-
-    if date_match:
-        try:
-            created_at = datetime.strptime(
-                date_match.group(1),
-                "%Y-%m-%d"
-            ).date()
-
-        except ValueError:
-            pass
-
-    # İstifadə sayı
     uses = extract_number([
         r"([\d.,]+\s*[KMB]?)\s+uses",
         r"([\d.,]+\s*[KMB]?)\s+kullanım"
-    ], page_text)
+    ], combined_text)
 
-    # Bəyənmə sayı
     likes = extract_number([
         r"([\d.,]+\s*[KMB]?)\s+likes",
         r"([\d.,]+\s*[KMB]?)\s+beğeni"
-    ], page_text)
+    ], combined_text)
 
     return title, uses, likes, created_at
 
@@ -179,7 +230,10 @@ def save_history(history):
 
 
 def get_template_id(url):
-    match = re.search(r"/(\d+)(?:[/?#]|$)", url)
+    match = re.search(
+        r"/(\d+)(?:[/?#]|$)",
+        url
+    )
 
     if match:
         return match.group(1)
@@ -194,9 +248,10 @@ def update_template_history(history, template_id, uses):
     if current_usage <= 0:
         return None
 
-    item = history.get(template_id, {
-        "snapshots": []
-    })
+    item = history.get(
+        template_id,
+        {"snapshots": []}
+    )
 
     snapshots = item.get("snapshots", [])
 
@@ -212,27 +267,33 @@ def update_template_history(history, template_id, uses):
 
     if previous:
         old_usage = previous.get("uses", 0)
-        old_date = date.fromisoformat(previous["date"])
+        old_date = date.fromisoformat(
+            previous["date"]
+        )
 
-        days = max((today - old_date).days, 1)
+        days = max(
+            (today - old_date).days,
+            1
+        )
 
         growth = current_usage - old_usage
         daily_growth = round(growth / days)
 
-    # Eyni günün təkrar ölçməsini yenilə
     today_snapshot = {
         "date": today.isoformat(),
         "uses": current_usage
     }
 
-    if snapshots and snapshots[-1].get("date") == today.isoformat():
+    if (
+        snapshots
+        and snapshots[-1].get("date") == today.isoformat()
+    ):
         snapshots[-1] = today_snapshot
+
     else:
         snapshots.append(today_snapshot)
 
-    # Tarixçəni çox böyüməsin deyə məhdudlaşdır
     item["snapshots"] = snapshots[-60:]
-
     history[template_id] = item
 
     return {
@@ -261,8 +322,14 @@ def get_capcut_trends(report):
     seen = set()
 
     for item in parser.links:
-        link = urljoin(capcut_url, item["url"])
-        name = " ".join(item["text"].split())
+        link = urljoin(
+            capcut_url,
+            item["url"]
+        )
+
+        name = " ".join(
+            item["text"].split()
+        )
 
         if (
             "/template-detail/" in link
@@ -276,10 +343,14 @@ def get_capcut_trends(report):
             })
 
     report.append(
-        f"\n🔍 Tapılan şablon linkləri: {len(templates)}"
+        f"\n🔍 Tapılan şablon linkləri: "
+        f"{len(templates)}"
     )
 
     recent_templates = []
+    checked = 0
+    no_date = 0
+    old_templates = 0
 
     for item in templates[:MAX_TEMPLATES_TO_CHECK]:
         try:
@@ -287,15 +358,19 @@ def get_capcut_trends(report):
                 get_template_details(item["link"])
             )
 
-            # Tarix təsdiqlənməyibsə qəbul etmə
+            checked += 1
+
             if created_at is None:
+                no_date += 1
                 continue
 
-            # Son 30 gündən köhnədirsə qəbul etmə
             if not (cutoff <= created_at <= today):
+                old_templates += 1
                 continue
 
-            template_id = get_template_id(item["link"])
+            template_id = get_template_id(
+                item["link"]
+            )
 
             growth_info = update_template_history(
                 history,
@@ -304,7 +379,11 @@ def get_capcut_trends(report):
             )
 
             recent_templates.append({
-                "title": title or item["name"],
+                "title": (
+                    title
+                    if title != "Şablon adı tapılmadı"
+                    else item["name"]
+                ),
                 "uses": uses,
                 "usage_number": parse_usage(uses),
                 "likes": likes,
@@ -316,17 +395,19 @@ def get_capcut_trends(report):
         except Exception as error:
             print(
                 "Şablon oxunmadı:",
+                item["link"],
                 str(error)[:150]
             )
 
     save_history(history)
 
-    # Əvvəl gündəlik artımı məlum olanları,
-    # sonra istifadə sayını nəzərə al
+    # Artım məlum olanlar əvvəl, sonra istifadə sayı.
     recent_templates.sort(
         key=lambda x: (
-            x["growth"] is not None
-            and x["growth"]["daily_growth"] is not None,
+            (
+                x["growth"] is not None
+                and x["growth"]["daily_growth"] is not None
+            ),
             (
                 x["growth"]["daily_growth"]
                 if x["growth"]
@@ -339,22 +420,41 @@ def get_capcut_trends(report):
     )
 
     report.append(
+        f"\n🔎 Yoxlanılan şablon: {checked}"
+    )
+
+    report.append(
+        f"📅 Tarixi tapılmayan: {no_date}"
+    )
+
+    report.append(
+        f"🕒 30 gündən köhnə: {old_templates}"
+    )
+
+    report.append(
         f"\n🆕 Son 30 gündə yayımlananlar: "
         f"{len(recent_templates)}"
     )
 
-    for i, item in enumerate(recent_templates[:10], 1):
+    for i, item in enumerate(
+        recent_templates[:10],
+        1
+    ):
         growth = item["growth"]
 
-        if growth and growth["daily_growth"] is not None:
+        if (
+            growth
+            and growth["daily_growth"] is not None
+        ):
             growth_text = (
                 f"Gündəlik artım: "
                 f"{growth['daily_growth']:+,} istifadə/gün"
             )
+
         else:
             growth_text = (
-                "Gündəlik artım: Hələ ölçülməyib "
-                "(ilk müşahidə)"
+                "Gündəlik artım: İlk ölçmə, "
+                "müqayisə üçün növbəti gün gözlənilir"
             )
 
         report.append(
@@ -374,12 +474,12 @@ def get_capcut_trends(report):
 
     report.append(
         "\nQeyd: Tarixi təsdiqlənməyən şablonlar "
-        "siyahıya daxil edilmir."
+        "yeni trend siyahısına daxil edilmir."
     )
 
     report.append(
-        "İlk ölçmədə artım göstəricisi olmur. "
-        "Müqayisə üçün növbəti günlük ölçmə lazımdır."
+        "İlk ölçmədə gündəlik artım bilinmir. "
+        "Ən azı iki fərqli gündə ölçmə lazımdır."
     )
 
 
@@ -409,7 +509,10 @@ def main():
             for item in parser.links:
                 link = item["url"]
 
-                if marker in link and link not in seen:
+                if (
+                    marker in link
+                    and link not in seen
+                ):
                     seen.add(link)
                     found.append(item)
 
@@ -477,9 +580,12 @@ def main():
         )
 
         with urllib.request.urlopen(
-            request, timeout=30
+            request,
+            timeout=30
         ) as response:
-            print(response.read().decode("utf-8"))
+            print(
+                response.read().decode("utf-8")
+            )
 
 
 if __name__ == "__main__":
